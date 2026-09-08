@@ -1,0 +1,596 @@
+//! Pure TUI application state machine.
+//!
+//! `App` owns every piece of mutable UI state and exposes side-effect-free
+//! transition methods. It has **no** dependency on crossterm or ratatui, so the
+//! state transitions are unit-testable without a real terminal. Rendering (in
+//! [`super::render`]) and the terminal event loop (in [`super::run`]) are the
+//! only layers that touch terminal-specific types.
+//!
+//! The daemon-facing half of the machine is [`App::apply_chat_event`] /
+//! [`App::apply_agent_event`], which translate the `astra.engine.v1`
+//! [`AgentEvent`] union (text / tool-call / tool-result / usage / notice /
+//! reasoning / done / error) into history lines and tool status. Streaming
+//! text is appended incrementally into [`App::streaming`] and only flushed to
+//! a history item at the next tool/control boundary, so a long stream never
+//! triggers a redraw-from-scratch.
+
+use astra_proto::astra::engine::v1::{agent_event, chat_event, AgentEvent, ChatEvent};
+
+/// Braille spinner frames, indexed by [`App::tick`].
+pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Agents shown when the daemon cannot be reached (or returns none).
+pub const DEFAULT_AGENTS: &[&str] = &["build", "plan", "explore", "general"];
+
+/// Whether a tool is currently running, and how the most recent one finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolStatus {
+    Idle,
+    Running { id: String, name: String },
+    Done { name: String, ok: bool },
+}
+
+/// One rendered history line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    User(String),
+    Assistant(String),
+    ToolCall {
+        name: String,
+    },
+    ToolResult {
+        name: String,
+        summary: String,
+        ok: bool,
+    },
+    Usage {
+        input: i64,
+        output: i64,
+        cost: Option<f64>,
+    },
+    Notice(String),
+    Reasoning(String),
+    Error(String),
+    Done(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct App {
+    /// Agent names offered by the picker (already de-duplicated/sorted).
+    pub agents: Vec<String>,
+    pub agent_index: usize,
+    /// The in-progress chat input buffer.
+    pub input: String,
+    pub cursor: usize,
+    /// Completed history lines, in order.
+    pub items: Vec<Item>,
+    /// In-flight assistant text (streamed incrementally).
+    pub streaming: String,
+    pub tool: ToolStatus,
+    /// True while a turn is in flight (between a send and its done/error).
+    pub running: bool,
+    pub error: Option<String>,
+    pub title: Option<String>,
+    /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
+    pub quit: bool,
+    /// Monotonic frame counter driving the spinner animation.
+    pub tick: u64,
+}
+
+impl App {
+    pub fn new(agents: Vec<String>) -> Self {
+        let agents = if agents.is_empty() {
+            DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect()
+        } else {
+            agents
+        };
+        let agent_index = agents.iter().position(|a| a == "build").unwrap_or(0);
+        Self {
+            agents,
+            agent_index,
+            input: String::new(),
+            cursor: 0,
+            items: Vec::new(),
+            streaming: String::new(),
+            tool: ToolStatus::Idle,
+            running: false,
+            error: None,
+            title: None,
+            quit: false,
+            tick: 0,
+        }
+    }
+
+    /// The name of the currently selected agent.
+    pub fn current_agent(&self) -> &str {
+        self.agents
+            .get(self.agent_index)
+            .map(String::as_str)
+            .unwrap_or("build")
+    }
+
+    /// The spinner glyph for the current tick.
+    pub fn spinner(&self) -> &'static str {
+        SPINNER[(self.tick as usize) % SPINNER.len()]
+    }
+
+    /// Advance the animation frame counter.
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    // --- input editing (all bounds-safe, cursor stays within char count) ---
+
+    pub fn push_char(&mut self, c: char) {
+        self.cursor = self.cursor.min(self.input.chars().count());
+        let mut chars: Vec<char> = self.input.chars().collect();
+        chars.insert(self.cursor, c);
+        self.input = chars.into_iter().collect();
+        self.cursor += 1;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.input.chars().collect();
+        chars.remove(self.cursor - 1);
+        self.input = chars.into_iter().collect();
+        self.cursor -= 1;
+    }
+
+    pub fn delete_forward(&mut self) {
+        let mut chars: Vec<char> = self.input.chars().collect();
+        if self.cursor < chars.len() {
+            chars.remove(self.cursor);
+            self.input = chars.into_iter().collect();
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    /// Submit the input buffer: returns the message to send when non-empty (and
+    /// resets the buffer), or `None` when the input is blank.
+    pub fn submit(&mut self) -> Option<String> {
+        let content = self.input.trim().to_string();
+        if content.is_empty() {
+            return None;
+        }
+        self.input.clear();
+        self.cursor = 0;
+        Some(content)
+    }
+
+    /// Record a user message + begin a new turn.
+    pub fn begin_turn(&mut self, content: String) {
+        self.items.push(Item::User(content));
+        self.streaming.clear();
+        self.tool = ToolStatus::Idle;
+        self.error = None;
+        self.running = true;
+    }
+
+    // --- agent picker ---
+
+    pub fn next_agent(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.agent_index = (self.agent_index + 1) % self.agents.len();
+    }
+
+    pub fn prev_agent(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.agent_index = (self.agent_index + self.agents.len() - 1) % self.agents.len();
+    }
+
+    pub fn request_quit(&mut self) {
+        self.quit = true;
+    }
+
+    // --- daemon events ---
+
+    /// Apply one multiplexed [`ChatEvent`]: forwards agent events to
+    /// [`App::apply_agent_event`] and handles host-synthesized control events.
+    pub fn apply_chat_event(&mut self, event: &ChatEvent) {
+        match &event.payload {
+            Some(chat_event::Payload::AgentEvent(env)) => {
+                if !crate::protocol::compatible(env.protocol_version) {
+                    self.items.push(Item::Notice(format!(
+                        "skipped agent event with incompatible protocol version {}",
+                        env.protocol_version
+                    )));
+                } else if let Some(event) = &env.event {
+                    self.apply_agent_event(event);
+                }
+            }
+            Some(chat_event::Payload::SessionError(e)) => {
+                self.flush_streaming();
+                self.items.push(Item::Error(e.message.clone()));
+                self.error = Some(e.message.clone());
+                self.running = false;
+            }
+            Some(chat_event::Payload::TitleChanged(t)) => {
+                self.title = Some(t.title.clone());
+            }
+            Some(chat_event::Payload::SessionEnded(_)) => {
+                self.running = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one [`AgentEvent`] variant.
+    pub fn apply_agent_event(&mut self, event: &AgentEvent) {
+        match &event.kind {
+            Some(agent_event::Kind::Text(t)) => self.streaming.push_str(&t.text),
+            Some(agent_event::Kind::ToolCall(t)) => {
+                self.flush_streaming();
+                self.items.push(Item::ToolCall {
+                    name: t.name.clone(),
+                });
+                self.tool = ToolStatus::Running {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                };
+            }
+            Some(agent_event::Kind::ToolResult(t)) => {
+                self.items.push(Item::ToolResult {
+                    name: t.name.clone(),
+                    summary: t.summary.clone(),
+                    ok: !t.is_error,
+                });
+                self.tool = ToolStatus::Done {
+                    name: t.name.clone(),
+                    ok: !t.is_error,
+                };
+            }
+            Some(agent_event::Kind::Usage(u)) => self.items.push(Item::Usage {
+                input: u.input_tokens,
+                output: u.output_tokens,
+                cost: u.cost_usd,
+            }),
+            Some(agent_event::Kind::Notice(n)) => self.items.push(Item::Notice(n.text.clone())),
+            Some(agent_event::Kind::Reasoning(r)) => {
+                self.items.push(Item::Reasoning(r.text.clone()))
+            }
+            Some(agent_event::Kind::Done(d)) => {
+                self.flush_streaming();
+                if let Some(result) = &d.result {
+                    if !result.is_empty() {
+                        self.items.push(Item::Done(result.clone()));
+                    }
+                }
+                self.running = false;
+            }
+            Some(agent_event::Kind::Error(e)) => {
+                self.flush_streaming();
+                self.items.push(Item::Error(e.message.clone()));
+                self.error = Some(e.message.clone());
+                self.running = false;
+            }
+            None => {}
+        }
+    }
+
+    /// Move any buffered streaming text into a completed `Assistant` history
+    /// item, clearing the buffer.
+    fn flush_streaming(&mut self) {
+        let text = std::mem::take(&mut self.streaming);
+        if !text.is_empty() {
+            self.items.push(Item::Assistant(text));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_proto::astra::engine::v1::{
+        agent_event, AgentEvent, DoneEvent, ErrorEvent, NoticeEvent, ReasoningEvent, TextEvent,
+        ToolCallEvent, ToolResultEvent, UsageEvent,
+    };
+
+    fn ev(kind: agent_event::Kind) -> AgentEvent {
+        AgentEvent { kind: Some(kind) }
+    }
+
+    fn text(s: &str) -> AgentEvent {
+        ev(agent_event::Kind::Text(TextEvent { text: s.into() }))
+    }
+
+    fn tool_call(id: &str, name: &str) -> AgentEvent {
+        ev(agent_event::Kind::ToolCall(ToolCallEvent {
+            id: id.into(),
+            name: name.into(),
+            input: "{}".into(),
+        }))
+    }
+
+    fn tool_result(name: &str, ok: bool) -> AgentEvent {
+        ev(agent_event::Kind::ToolResult(ToolResultEvent {
+            id: "t1".into(),
+            name: name.into(),
+            summary: "done".into(),
+            output: "".into(),
+            is_error: !ok,
+            truncated: false,
+            full_output: None,
+        }))
+    }
+
+    fn usage() -> AgentEvent {
+        ev(agent_event::Kind::Usage(UsageEvent {
+            input_tokens: 12,
+            output_tokens: 7,
+            cost_usd: Some(0.0042),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }))
+    }
+
+    fn done() -> AgentEvent {
+        ev(agent_event::Kind::Done(DoneEvent {
+            result: None,
+            num_turns: Some(1),
+        }))
+    }
+
+    #[test]
+    fn scripted_sequence_produces_correct_state() {
+        let mut app = App::new(vec!["build".into(), "plan".into()]);
+        app.begin_turn("do the thing".into());
+
+        app.apply_agent_event(&text("hello "));
+        app.apply_agent_event(&text("world"));
+        assert_eq!(app.streaming, "hello world");
+        assert_eq!(app.tool, ToolStatus::Idle);
+
+        app.apply_agent_event(&tool_call("t1", "bash"));
+        // streaming text is flushed to history at the tool boundary
+        assert_eq!(app.streaming, "");
+        assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
+        assert!(matches!(app.items[2], Item::ToolCall { ref name } if name == "bash"));
+        assert_eq!(
+            app.tool,
+            ToolStatus::Running {
+                id: "t1".into(),
+                name: "bash".into()
+            }
+        );
+
+        app.apply_agent_event(&tool_result("bash", true));
+        assert_eq!(
+            app.tool,
+            ToolStatus::Done {
+                name: "bash".into(),
+                ok: true
+            }
+        );
+
+        app.apply_agent_event(&usage());
+        assert!(matches!(
+            app.items.last(),
+            Some(Item::Usage {
+                input: 12,
+                output: 7,
+                ..
+            })
+        ));
+
+        assert!(app.running);
+        app.apply_agent_event(&done());
+        assert!(!app.running);
+
+        // full history order: user, assistant(text), tool-call, tool-result, usage
+        assert_eq!(app.items.len(), 5);
+        assert!(matches!(app.items[0], Item::User(ref s) if s == "do the thing"));
+        assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
+        assert!(matches!(app.items[2], Item::ToolCall { ref name } if name == "bash"));
+        assert!(
+            matches!(app.items[3], Item::ToolResult { ref name, ok: true, .. } if name == "bash")
+        );
+        assert!(matches!(app.items[4], Item::Usage { .. }));
+    }
+
+    #[test]
+    fn failed_tool_result_marks_tool_failed() {
+        let mut app = App::new(vec![]);
+        app.apply_agent_event(&tool_call("t2", "edit"));
+        app.apply_agent_event(&tool_result("edit", false));
+        assert_eq!(
+            app.tool,
+            ToolStatus::Done {
+                name: "edit".into(),
+                ok: false
+            }
+        );
+        assert!(matches!(
+            app.items.last(),
+            Some(Item::ToolResult { ok: false, .. })
+        ));
+    }
+
+    #[test]
+    fn every_event_variant_is_rendered_to_history() {
+        let mut app = App::new(vec![]);
+        app.apply_agent_event(&ev(agent_event::Kind::Notice(NoticeEvent {
+            text: "n".into(),
+        })));
+        app.apply_agent_event(&ev(agent_event::Kind::Reasoning(ReasoningEvent {
+            text: "r".into(),
+            seq: 0,
+        })));
+        app.apply_agent_event(&ev(agent_event::Kind::Error(ErrorEvent {
+            message: "boom".into(),
+        })));
+        assert!(matches!(app.items[0], Item::Notice(ref s) if s == "n"));
+        assert!(matches!(app.items[1], Item::Reasoning(ref s) if s == "r"));
+        assert!(matches!(app.items[2], Item::Error(ref s) if s == "boom"));
+        assert_eq!(app.error.as_deref(), Some("boom"));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn done_flushes_streaming_and_stops_running() {
+        let mut app = App::new(vec![]);
+        app.running = true;
+        app.apply_agent_event(&text("final"));
+        assert_eq!(app.streaming, "final");
+        app.apply_agent_event(&done());
+        assert_eq!(app.streaming, "");
+        assert!(matches!(app.items.last(), Some(Item::Assistant(ref s)) if s == "final"));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn input_editing_respects_cursor() {
+        let mut app = App::new(vec![]);
+        app.push_char('a');
+        app.push_char('c');
+        app.cursor_left();
+        app.push_char('b'); // insert before 'c'
+        assert_eq!(app.input, "abc");
+        app.cursor_home();
+        app.delete_forward();
+        assert_eq!(app.input, "bc");
+        app.cursor_end();
+        app.backspace();
+        assert_eq!(app.input, "b");
+    }
+
+    #[test]
+    fn submit_trims_and_resets() {
+        let mut app = App::new(vec![]);
+        app.push_char(' ');
+        app.push_char('x');
+        app.push_char(' ');
+        assert_eq!(app.submit(), Some("x".into()));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.submit(), None);
+    }
+
+    #[test]
+    fn agent_picker_wraps_and_defaults_to_build() {
+        let mut app = App::new(vec!["build".into(), "plan".into(), "explore".into()]);
+        assert_eq!(app.current_agent(), "build");
+        app.prev_agent();
+        assert_eq!(app.current_agent(), "explore");
+        app.next_agent();
+        assert_eq!(app.current_agent(), "build");
+    }
+
+    #[test]
+    fn empty_agents_fall_back_to_defaults() {
+        let app = App::new(vec![]);
+        assert_eq!(app.agents, DEFAULT_AGENTS);
+        assert_eq!(app.current_agent(), "build");
+    }
+
+    #[test]
+    fn tick_cycles_spinner() {
+        let mut app = App::new(vec![]);
+        assert_eq!(app.spinner(), SPINNER[0]);
+        for _ in 0..SPINNER.len() {
+            app.tick();
+        }
+        assert_eq!(app.spinner(), SPINNER[0]);
+    }
+
+    #[test]
+    fn control_events_are_applied() {
+        use astra_proto::astra::engine::v1::{
+            chat_event, AgentEventEnvelope, ChatEvent, SessionError, TitleChanged,
+        };
+        let mut app = App::new(vec![]);
+
+        let chat = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::TitleChanged(TitleChanged {
+                title: "my session".into(),
+            })),
+        };
+        app.apply_chat_event(&chat);
+        assert_eq!(app.title.as_deref(), Some("my session"));
+
+        let err = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::SessionError(SessionError {
+                message: "nope".into(),
+            })),
+        };
+        app.apply_chat_event(&err);
+        assert!(matches!(app.items.last(), Some(Item::Error(ref s)) if s == "nope"));
+
+        // A chat event wrapping an agent event reaches the same code path.
+        let env = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AgentEvent(AgentEventEnvelope {
+                protocol_version: 1.3,
+                event: Some(text("via chat")),
+            })),
+        };
+        app.apply_chat_event(&env);
+        assert_eq!(app.streaming, "via chat");
+    }
+
+    #[test]
+    fn incompatible_protocol_version_is_skipped_with_notice() {
+        use astra_proto::astra::engine::v1::{chat_event, AgentEventEnvelope, ChatEvent};
+        let mut app = App::new(vec![]);
+
+        let chat = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AgentEvent(AgentEventEnvelope {
+                protocol_version: 2.0,
+                event: Some(text("should not render")),
+            })),
+        };
+        app.apply_chat_event(&chat);
+
+        assert!(app.streaming.is_empty(), "mismatched event must be skipped");
+        assert!(matches!(
+            app.items.last(),
+            Some(Item::Notice(ref s)) if s.contains("incompatible protocol version")
+        ));
+    }
+
+    #[test]
+    fn unknown_event_variant_is_skipped_gracefully() {
+        use astra_proto::astra::engine::v1::{chat_event, AgentEventEnvelope, ChatEvent};
+        let mut app = App::new(vec![]);
+
+        // A future/unknown oneof variant yields `None` for `env.event`.
+        let chat = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AgentEvent(AgentEventEnvelope {
+                protocol_version: 1.3,
+                event: None,
+            })),
+        };
+        app.apply_chat_event(&chat);
+
+        assert!(app.items.is_empty(), "unknown event must not add history");
+        assert!(app.streaming.is_empty());
+    }
+}
