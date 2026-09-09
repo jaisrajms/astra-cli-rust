@@ -239,7 +239,11 @@ mod tests {
         .await
         .expect("mcp configure should succeed");
 
-        let captured = configured.lock().unwrap().take().expect("configure captured");
+        let captured = configured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("configure captured");
         assert_eq!(captured.name, "remote");
         assert_eq!(captured.kind, "remote");
         assert_eq!(captured.url.as_deref(), Some("https://example.com/mcp"));

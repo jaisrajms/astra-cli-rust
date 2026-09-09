@@ -101,14 +101,12 @@ async fn delete(args: DeleteArgs, channel: Channel) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_proto::astra::engine::v1::fleet_service_server::{
-        FleetService, FleetServiceServer,
-    };
+    use astra_proto::astra::engine::v1::fleet_service_server::{FleetService, FleetServiceServer};
     use astra_proto::astra::engine::v1::{
-        CronCreateResponse, CronDeleteResponse, CronEntry, CronListResponse,
-        ListChildrenRequest, ListChildrenResponse, TaskCreateRequest, TaskCreateResponse,
-        TaskListRequest, TaskListResponse, TaskOutputRequest, TaskOutputResponse, TaskStopRequest,
-        TaskStopResponse, TeamCreateRequest, TeamCreateResponse, TeamListRequest, TeamListResponse,
+        CronCreateResponse, CronDeleteResponse, CronEntry, CronListResponse, ListChildrenRequest,
+        ListChildrenResponse, TaskCreateRequest, TaskCreateResponse, TaskListRequest,
+        TaskListResponse, TaskOutputRequest, TaskOutputResponse, TaskStopRequest, TaskStopResponse,
+        TeamCreateRequest, TeamCreateResponse, TeamListRequest, TeamListResponse,
     };
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status};
@@ -253,7 +251,9 @@ mod tests {
 
         handle(
             CronArgs {
-                command: CronCommand::Delete(DeleteArgs { id: "cron-9".into() }),
+                command: CronCommand::Delete(DeleteArgs {
+                    id: "cron-9".into(),
+                }),
             },
             channel,
         )

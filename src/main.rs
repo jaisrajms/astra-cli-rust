@@ -84,7 +84,7 @@ async fn dispatch(command: Command, channel: tonic::transport::Channel) -> anyho
         Command::Workflow(args) => workflow::handle(args, channel).await,
         Command::Config(args) => config::handle(args).await,
         Command::Auth(args) => auth::handle(args).await,
-        Command::Doctor(args) => doctor::handle(args).await,
+        Command::Doctor(args) => doctor::handle(args, channel).await,
     }
 }
 

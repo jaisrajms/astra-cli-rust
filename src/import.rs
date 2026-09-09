@@ -126,7 +126,9 @@ mod tests {
             *self.imported.lock().unwrap() = Some(request.into_inner());
             Ok(Response::new(ImportSessionResponse {
                 session: Some(SessionSummary {
-                    session_id: Some(SessionId { value: "s-9".into() }),
+                    session_id: Some(SessionId {
+                        value: "s-9".into(),
+                    }),
                     parent_id: None,
                     title: "imported".into(),
                     agent: "build".into(),
@@ -150,7 +152,8 @@ mod tests {
         let addr = crate::testutil::spawn(SessionServiceServer::new(mock)).await;
         let channel = crate::testutil::channel(addr);
 
-        let path = std::env::temp_dir().join(format!("astra-import-test-{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("astra-import-test-{}.bin", std::process::id()));
         std::fs::write(&path, b"exported-payload").expect("write payload file");
 
         handle(

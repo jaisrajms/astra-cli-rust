@@ -77,15 +77,13 @@ async fn list(channel: Channel) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_proto::astra::engine::v1::fleet_service_server::{
-        FleetService, FleetServiceServer,
-    };
+    use astra_proto::astra::engine::v1::fleet_service_server::{FleetService, FleetServiceServer};
     use astra_proto::astra::engine::v1::{
         CronCreateRequest, CronCreateResponse, CronDeleteRequest, CronDeleteResponse,
-        CronListRequest, CronListResponse, ListChildrenRequest, ListChildrenResponse, Team,
-        TeamCreateResponse, TeamListResponse, TaskCreateRequest, TaskCreateResponse,
-        TaskListRequest, TaskListResponse, TaskOutputRequest, TaskOutputResponse,
-        TaskStopRequest, TaskStopResponse,
+        CronListRequest, CronListResponse, ListChildrenRequest, ListChildrenResponse,
+        TaskCreateRequest, TaskCreateResponse, TaskListRequest, TaskListResponse,
+        TaskOutputRequest, TaskOutputResponse, TaskStopRequest, TaskStopResponse, Team,
+        TeamCreateResponse, TeamListResponse,
     };
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status};
@@ -129,9 +127,7 @@ mod tests {
             request: Request<TeamCreateRequest>,
         ) -> Result<Response<TeamCreateResponse>, Status> {
             let req = request.into_inner();
-            let ids = (1..=req.prompts.len())
-                .map(|i| format!("t-{i}"))
-                .collect();
+            let ids = (1..=req.prompts.len()).map(|i| format!("t-{i}")).collect();
             *self.created.lock().unwrap() = Some(req);
             Ok(Response::new(TeamCreateResponse {
                 team: Some(Team {

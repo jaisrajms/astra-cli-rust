@@ -137,9 +137,7 @@ async fn stop(args: StopArgs, channel: Channel) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_proto::astra::engine::v1::fleet_service_server::{
-        FleetService, FleetServiceServer,
-    };
+    use astra_proto::astra::engine::v1::fleet_service_server::{FleetService, FleetServiceServer};
     use astra_proto::astra::engine::v1::{
         CronCreateRequest, CronCreateResponse, CronDeleteRequest, CronDeleteResponse,
         CronListRequest, CronListResponse, FleetTask, ListChildrenRequest, ListChildrenResponse,
@@ -326,7 +324,12 @@ mod tests {
         .await
         .expect("task output should succeed");
         assert_eq!(
-            output.lock().unwrap().take().expect("output captured").task_id,
+            output
+                .lock()
+                .unwrap()
+                .take()
+                .expect("output captured")
+                .task_id,
             "t-7"
         );
 
@@ -341,7 +344,12 @@ mod tests {
         .await
         .expect("task stop should succeed");
         assert_eq!(
-            stopped.lock().unwrap().take().expect("stop captured").task_id,
+            stopped
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stop captured")
+                .task_id,
             "t-7"
         );
     }

@@ -50,6 +50,16 @@ pub fn connect(endpoint: &str) -> anyhow::Result<Channel> {
     Ok(channel)
 }
 
+/// The resolved daemon endpoint string, with the socket default applied. Mirrors
+/// `Cli::endpoint()` (reads `ASTRA_ENDPOINT`, defaults to `~/.astra/engine.sock`)
+/// so a handler that doesn't receive the parsed `Cli` can still display it.
+pub fn resolved_endpoint() -> String {
+    match std::env::var("ASTRA_ENDPOINT") {
+        Ok(e) if !e.trim().is_empty() => e,
+        _ => "~/.astra/engine.sock".to_string(),
+    }
+}
+
 /// Expand a leading `~` in a socket path to the user's home directory.
 pub fn expand_home(path: &str) -> PathBuf {
     if path == "~" {

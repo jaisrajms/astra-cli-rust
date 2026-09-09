@@ -1,9 +1,13 @@
 //! `astra config` — local CLI configuration.
 //!
-//! NOTE (E-02): there is no engine service for CLI config; this is an
-//! arg-parse scaffold.
+//! The CLI's only persisted knob today is the daemon endpoint (`--endpoint` /
+//! `ASTRA_ENDPOINT`); all other configuration lives in the daemon/workspace
+//! (`.astra/*`, `~/.astra/*`). `config` therefore reports the resolved endpoint
+//! and how it was set, and `config endpoint` prints just the endpoint value.
 
 use clap::{Args, Subcommand};
+
+use crate::endpoint;
 
 #[derive(Args)]
 pub struct ConfigArgs {
@@ -18,13 +22,23 @@ pub enum ConfigCommand {
 }
 
 pub async fn handle(args: ConfigArgs) -> anyhow::Result<()> {
-    // TODO(E-02): persist CLI config once the daemon exposes a config surface.
+    let endpoint = endpoint::resolved_endpoint();
+    let source = match std::env::var("ASTRA_ENDPOINT") {
+        Ok(e) if !e.trim().is_empty() => {
+            format!("ASTRA_ENDPOINT (value: {e})")
+        }
+        _ => "default".to_string(),
+    };
+
     match args.command {
         Some(ConfigCommand::Endpoint) => {
-            println!("endpoint: ~/.astra/engine.sock (default; override with --endpoint / ASTRA_ENDPOINT)");
+            println!("{endpoint}");
         }
         None => {
-            println!("config: not yet persisted (E-02 stub)");
+            println!("endpoint: {endpoint} (source: {source})");
+            println!(
+                "other configuration lives in the daemon/workspace (`.astra/*`, `~/.astra/*`)."
+            );
         }
     }
     Ok(())

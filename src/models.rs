@@ -119,7 +119,11 @@ mod tests {
         .await
         .expect("models list should succeed");
 
-        let captured = list_models.lock().unwrap().take().expect("list_models captured");
+        let captured = list_models
+            .lock()
+            .unwrap()
+            .take()
+            .expect("list_models captured");
         assert_eq!(captured.provider.as_deref(), Some("anthropic"));
     }
 }
