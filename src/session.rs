@@ -213,10 +213,10 @@ mod tests {
         SessionService, SessionServiceServer,
     };
     use astra_proto::astra::engine::v1::{
-        DeleteSessionRequest, DeleteSessionResponse, ExportSessionRequest, ExportSessionResponse,
-        ForkSessionRequest, ForkSessionResponse, GetSessionRequest, GetSessionResponse,
-        ImportSessionRequest, ImportSessionResponse, ListSessionsResponse, ResumeSessionRequest,
-        ResumeSessionResponse,
+        CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
+        ExportSessionRequest, ExportSessionResponse, ForkSessionRequest, ForkSessionResponse,
+        GetSessionRequest, GetSessionResponse, ImportSessionRequest, ImportSessionResponse,
+        ListSessionsResponse, ResumeSessionRequest, ResumeSessionResponse,
     };
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status};
@@ -243,6 +243,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl SessionService for MockSessionService {
+        async fn create_session(
+            &self,
+            _: Request<CreateSessionRequest>,
+        ) -> Result<Response<CreateSessionResponse>, Status> {
+            Err(Status::unimplemented("create_session"))
+        }
+
         async fn list_sessions(
             &self,
             request: Request<ListSessionsRequest>,
