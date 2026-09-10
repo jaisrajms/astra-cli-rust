@@ -22,7 +22,7 @@ use crate::team::TeamArgs;
 use crate::workflow::WorkflowArgs;
 
 #[derive(Parser)]
-#[command(name = "astra", version, about = "Astra CLI (opencode parity)", long_about = None)]
+#[command(name = "astra", version, about = "Astra CLI", long_about = None)]
 pub struct Cli {
     /// Daemon endpoint: a Unix socket path (default `~/.astra/engine.sock`) or
     /// an `http(s)://` URI. Overridable via the `ASTRA_ENDPOINT` env var.

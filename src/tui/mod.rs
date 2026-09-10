@@ -1,6 +1,6 @@
-//! Default full-screen TUI (opencode parity, E-01).
+//! Default full-screen TUI (E-01).
 //!
-//! Layout of the module mirrors the opencode ground truth split: a **pure**
+//! Layout of the module mirrors the reference implementation split: a **pure**
 //! [`App`] state machine ([`app`]), a pure [`render`] function ([`render`]),
 //! and a thin terminal + daemon event loop here ([`run`]). The state machine is
 //! unit-testable without a terminal; `render` is exercisable against ratatui's
@@ -116,7 +116,7 @@ async fn handle_terminal_event(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_quit();
         }
-        // Match opencode: `q` quits only when the prompt is empty.
+        // Match the reference CLI: `q` quits only when the prompt is empty.
         KeyCode::Char('q') if app.input.is_empty() => {
             app.request_quit();
         }

@@ -1,6 +1,6 @@
 //! Astra CLI entry point.
 //!
-//! Parses the subcommand surface (opencode parity) and dispatches to the
+//! Parses the subcommand surface and dispatches to the
 //! per-subcommand handler, which is a thin async fn taking a tonic
 //! [`Channel`] so it can be exercised against a mock server in tests.
 

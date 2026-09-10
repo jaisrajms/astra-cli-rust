@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
 license = "UNLICENSED"
-description = "Astra CLI (opencode parity): subcommand surface over the astra daemon gRPC services."
+description = "Astra CLI: subcommand surface over the astra daemon gRPC services."
 
 [[bin]]
 name = "astra"
