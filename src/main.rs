@@ -24,6 +24,7 @@ mod serve;
 mod session;
 mod task;
 mod team;
+mod tool;
 mod tui;
 mod workflow;
 

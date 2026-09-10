@@ -1,6 +1,10 @@
 //! `astra run [message..]` — one-shot message over the chat stream.
+//!
+//! Output parity with opencode `run`: a single `> {agent} · {model}` header on
+//! stderr, the assistant's text on stdout, `Thinking:` reasoning, inline tool
+//! calls on stderr, and no `[usage]`/`[tool]` marker noise.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 use anyhow::Context;
 use clap::Args;
@@ -8,12 +12,13 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 use crate::endpoint::with_workspace;
+use crate::tool::{summarize_input, tool_icon};
 
 use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::session_service_client::SessionServiceClient;
 use astra_proto::astra::engine::v1::{
-    agent_event, chat_client_msg, chat_event, ChatClientMsg, ChatEvent, ForkSessionRequest,
-    ListSessionsRequest, SendMessage,
+    agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent,
+    ForkSessionRequest, ListSessionsRequest, SendMessage,
 };
 use astra_proto::{MessageId, SessionId};
 
@@ -40,6 +45,32 @@ pub struct RunArgs {
     /// Execution target: `local` | `split` | `container`.
     #[arg(long, value_name = "EXEC")]
     pub exec: Option<String>,
+    /// Output format: `default` | `json`.
+    #[arg(long, value_name = "FORMAT", default_value = "default")]
+    pub format: String,
+    /// Show thinking blocks.
+    #[arg(long)]
+    pub thinking: bool,
+    /// Session title.
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+    /// Model reasoning variant.
+    #[arg(long, value_name = "VARIANT")]
+    pub variant: Option<String>,
+    /// Auto-approve permissions (dangerous).
+    #[arg(long)]
+    pub auto: bool,
+    /// Alias for --auto (hidden).
+    #[arg(long, hide = true)]
+    pub yolo: bool,
+}
+
+/// Renderer configuration for `run` output.
+pub struct RenderConfig {
+    pub agent: String,
+    pub model: Option<String>,
+    pub thinking: bool,
+    pub json: bool,
 }
 
 pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
@@ -51,10 +82,10 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
         session_id: session_id.map(|v| SessionId { value: v }),
         payload: Some(chat_client_msg::Payload::SendMessage(SendMessage {
             content: message,
-            agent: args.agent.unwrap_or_else(|| "build".to_string()),
-            model: args.model,
+            agent: args.agent.clone().unwrap_or_else(|| "build".to_string()),
+            model: args.model.clone(),
             images: Vec::new(),
-            exec: args.exec,
+            exec: args.exec.clone(),
         })),
     };
 
@@ -64,27 +95,200 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
         .await?;
     let stream = resp.into_inner();
 
-    consume_stream(stream, std::io::stdout(), std::io::stderr()).await
+    let config = RenderConfig {
+        agent: args.agent.unwrap_or_else(|| "build".to_string()),
+        model: args.model.clone(),
+        thinking: args.thinking,
+        json: args.format == "json",
+    };
+    consume_stream(stream, std::io::stdout(), std::io::stderr(), config).await
 }
 
 /// Consume the chat stream, rendering each event. The terminal `Done` event is
 /// rendered (so its `result` is emitted) before the loop breaks.
-async fn consume_stream<S, W, E>(mut stream: S, mut out: W, mut err: E) -> anyhow::Result<()>
+async fn consume_stream<S, W, E>(
+    mut stream: S,
+    out: W,
+    err: E,
+    config: RenderConfig,
+) -> anyhow::Result<()>
 where
     S: futures::Stream<Item = Result<ChatEvent, tonic::Status>> + Unpin,
-    W: std::io::Write,
-    E: std::io::Write,
+    W: Write,
+    E: Write,
 {
     use futures::StreamExt;
+    let mut renderer = Renderer {
+        out,
+        err,
+        config,
+        header_printed: false,
+        text_buf: String::new(),
+    };
     while let Some(event) = stream.next().await {
         let event = event?;
         let is_done = done(&event);
-        render_to(&event, &mut out, &mut err);
+        renderer.render(&event);
         if is_done {
             break;
         }
     }
     Ok(())
+}
+
+/// The stateful `run` renderer: header-once, text→stdout, tool/thinking→stderr.
+struct Renderer<W, E> {
+    out: W,
+    err: E,
+    config: RenderConfig,
+    header_printed: bool,
+    /// Accumulated streaming text deltas, flushed (trimmed) at a part boundary.
+    text_buf: String,
+}
+
+impl<W: Write, E: Write> Renderer<W, E> {
+    fn render(&mut self, event: &ChatEvent) {
+        match &event.payload {
+            Some(chat_event::Payload::AgentEvent(env)) => {
+                if !crate::protocol::compatible(env.protocol_version) {
+                    let _ = writeln!(
+                        self.err,
+                        "[notice] skipping agent event with incompatible protocol version {}",
+                        env.protocol_version
+                    );
+                    return;
+                }
+                if let Some(inner) = &env.event {
+                    self.render_agent(inner);
+                }
+            }
+            Some(chat_event::Payload::SessionError(e)) => {
+                self.flush_text();
+                let _ = writeln!(self.err, "[session error] {}", e.message);
+            }
+            Some(chat_event::Payload::TitleChanged(t)) => {
+                if self.config.json {
+                    let _ = writeln!(
+                        self.out,
+                        "{}",
+                        serde_json::json!({
+                            "type": "title",
+                            "timestamp": now_ms(),
+                            "title": t.title,
+                        })
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn header(&mut self) {
+        if self.header_printed {
+            return;
+        }
+        self.header_printed = true;
+        let line = match &self.config.model {
+            Some(m) => format!("> {} · {}", self.config.agent, m),
+            None => format!("> {}", self.config.agent),
+        };
+        let _ = writeln!(self.err);
+        let _ = writeln!(self.err, "{line}");
+        let _ = writeln!(self.err);
+    }
+
+    /// Flush the accumulated text as one finalized part (trimmed), matching opencode's
+    /// finalized-text-part output.
+    fn flush_text(&mut self) {
+        let text = self.text_buf.trim().to_string();
+        self.text_buf.clear();
+        if text.is_empty() {
+            return;
+        }
+        if self.config.json {
+            self.emit("text", serde_json::json!({ "part": { "text": text } }));
+        } else {
+            self.header();
+            let _ = writeln!(self.out, "{text}");
+        }
+    }
+
+    fn render_agent(&mut self, event: &AgentEvent) {
+        match &event.kind {
+            Some(agent_event::Kind::Text(t)) => {
+                self.text_buf.push_str(&t.text);
+            }
+            Some(agent_event::Kind::Reasoning(r)) => {
+                if !self.config.thinking {
+                    return;
+                }
+                let text = r.text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                if self.config.json {
+                    self.emit("reasoning", serde_json::json!({ "part": { "text": text } }));
+                } else {
+                    self.header();
+                    let _ = writeln!(self.err, "Thinking: {text}");
+                }
+            }
+            Some(agent_event::Kind::ToolCall(t)) => {
+                self.flush_text();
+                if self.config.json {
+                    self.emit(
+                        "tool_use",
+                        serde_json::json!({ "part": { "tool": t.name, "input": t.input } }),
+                    );
+                } else {
+                    self.header();
+                    let args = summarize_input(&t.input);
+                    let _ = writeln!(self.err, "{} {}{}", tool_icon(&t.name), t.name, args);
+                }
+            }
+            Some(agent_event::Kind::ToolResult(t)) => {
+                // opencode `run` is quiet on success; only failures are surfaced.
+                if t.is_error {
+                    let _ = writeln!(self.err, "✗ {} failed", t.name);
+                    if !t.summary.is_empty() {
+                        let _ = writeln!(self.err, "Error: {}", t.summary);
+                    }
+                }
+            }
+            Some(agent_event::Kind::Error(e)) => {
+                self.flush_text();
+                if self.config.json {
+                    self.emit("error", serde_json::json!({ "error": e.message }));
+                } else {
+                    let _ = writeln!(self.err, "Error: {}", e.message);
+                }
+            }
+            Some(agent_event::Kind::Notice(n)) => {
+                let _ = writeln!(self.err, "{}", n.text);
+            }
+            Some(agent_event::Kind::Done(_)) => {
+                self.flush_text();
+            }
+            Some(agent_event::Kind::Usage(_)) | None => {}
+        }
+    }
+
+    /// Emit one JSON event line (opencode `--format json` shape).
+    fn emit(&mut self, ty: &str, data: serde_json::Value) {
+        let mut obj = data;
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("type".to_string(), serde_json::json!(ty));
+            map.insert("timestamp".to_string(), serde_json::json!(now_ms()));
+        }
+        let _ = writeln!(self.out, "{obj}");
+    }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 async fn resolve_message(args: &RunArgs) -> anyhow::Result<String> {
@@ -183,73 +387,25 @@ fn done(event: &ChatEvent) -> bool {
     false
 }
 
-fn render_to(event: &ChatEvent, out: &mut impl std::io::Write, err: &mut impl std::io::Write) {
-    match &event.payload {
-        Some(chat_event::Payload::AgentEvent(env)) => {
-            if !crate::protocol::compatible(env.protocol_version) {
-                let _ = writeln!(
-                    err,
-                    "[notice] skipping agent event with incompatible protocol version {}",
-                    env.protocol_version
-                );
-                return;
-            }
-            if let Some(inner) = &env.event {
-                match &inner.kind {
-                    Some(agent_event::Kind::Text(t)) => {
-                        let _ = write!(out, "{}", t.text);
-                    }
-                    Some(agent_event::Kind::ToolCall(t)) => {
-                        let _ = writeln!(out, "\n[tool] {}", t.name);
-                    }
-                    Some(agent_event::Kind::ToolResult(t)) => {
-                        let _ = writeln!(out, "[tool result] {}: {}", t.name, t.summary);
-                    }
-                    Some(agent_event::Kind::Usage(u)) => {
-                        let _ = writeln!(
-                            out,
-                            "\n[usage] in={} out={} cost={:?}",
-                            u.input_tokens, u.output_tokens, u.cost_usd
-                        );
-                    }
-                    Some(agent_event::Kind::Notice(n)) => {
-                        let _ = writeln!(out, "{}", n.text);
-                    }
-                    Some(agent_event::Kind::Reasoning(r)) => {
-                        let _ = writeln!(out, "[reasoning] {}", r.text);
-                    }
-                    Some(agent_event::Kind::Done(d)) => {
-                        if let Some(result) = &d.result {
-                            let _ = writeln!(out, "\n{result}");
-                        }
-                    }
-                    Some(agent_event::Kind::Error(e)) => {
-                        let _ = writeln!(err, "[error] {}", e.message);
-                    }
-                    None => {}
-                }
-            }
-        }
-        Some(chat_event::Payload::SessionError(e)) => {
-            let _ = writeln!(err, "[session error] {}", e.message);
-        }
-        Some(chat_event::Payload::TitleChanged(t)) => {
-            let _ = writeln!(out, "[title] {}", t.title);
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_proto::astra::engine::v1::chat_service_server::{ChatService, ChatServiceServer};
     use astra_proto::astra::engine::v1::{
-        agent_event, chat_event, AgentEvent, AgentEventEnvelope, ChatEvent, DoneEvent, TextEvent,
+        agent_event, chat_event, AgentEventEnvelope, ChatEvent, DoneEvent, TextEvent, UsageEvent,
     };
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use tonic::{Response, Status, Streaming};
+
+    fn config() -> RenderConfig {
+        RenderConfig {
+            agent: "build".to_string(),
+            model: Some("deepseek/deepseek-chat".to_string()),
+            thinking: false,
+            json: false,
+        }
+    }
 
     #[derive(Clone)]
     struct MockChatService {
@@ -277,6 +433,24 @@ mod tests {
                     kind: Some(agent_event::Kind::Done(DoneEvent {
                         result: result.map(str::to_string),
                         num_turns: Some(1),
+                    })),
+                }),
+            })),
+        }
+    }
+
+    fn usage_event() -> ChatEvent {
+        ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AgentEvent(AgentEventEnvelope {
+                protocol_version: 1.3,
+                event: Some(AgentEvent {
+                    kind: Some(agent_event::Kind::Usage(UsageEvent {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cost_usd: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
                     })),
                 }),
             })),
@@ -326,6 +500,12 @@ mod tests {
                 session: None,
                 fork: false,
                 exec: None,
+                format: "default".into(),
+                thinking: false,
+                title: None,
+                variant: None,
+                auto: false,
+                yolo: false,
             },
             channel,
         )
@@ -356,6 +536,12 @@ mod tests {
                 session: None,
                 fork: false,
                 exec: None,
+                format: "default".into(),
+                thinking: false,
+                title: None,
+                variant: None,
+                auto: false,
+                yolo: false,
             },
             channel,
         )
@@ -363,29 +549,58 @@ mod tests {
         .expect("run should complete");
 
         let msgs = received.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "just one");
         assert_eq!(msgs[0].agent, "build");
     }
 
     #[tokio::test]
-    async fn done_with_result_is_rendered() {
+    async fn text_is_clean_with_header_and_no_usage_noise() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, Status>(usage_event()),
+            Ok(text_event("hi ")),
+            Ok(text_event("there")),
+            Ok(done_event(None)),
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        consume_stream(stream, &mut out, &mut err, config())
+            .await
+            .expect("stream should consume");
+
+        let out_text = String::from_utf8(out).unwrap();
+        // Streaming text deltas accumulate into one trimmed part on stdout; no [usage] markers.
+        assert_eq!(out_text, "hi there\n", "unexpected stdout: {out_text}");
+        // Header is on stderr once.
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(
+            err_text.contains("> build · deepseek/deepseek-chat"),
+            "header missing: {err_text}"
+        );
+        assert_eq!(
+            err_text.matches("> build ·").count(),
+            1,
+            "header should print once: {err_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_with_result_is_not_duplicated() {
         let stream = futures::stream::iter(vec![
             Ok::<_, Status>(text_event("hi")),
             Ok(done_event(Some("final answer"))),
         ]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        consume_stream(stream, &mut out, &mut err)
+        consume_stream(stream, &mut out, &mut err, config())
             .await
             .expect("stream should consume");
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("hi"), "text event rendered: {text}");
+        assert!(text.contains("hi"), "text rendered: {text}");
+        // The Done result is NOT re-printed (opencode prints text parts, not a `result`).
         assert!(
-            text.contains("final answer"),
-            "done result rendered: {text}"
+            !text.contains("final answer"),
+            "done result not duplicated: {text}"
         );
-        assert!(err.is_empty(), "no error output expected: {err:?}");
     }
 
     #[tokio::test]
@@ -404,7 +619,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<_, Status>(bad)]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        consume_stream(stream, &mut out, &mut err)
+        consume_stream(stream, &mut out, &mut err, config())
             .await
             .expect("stream should consume");
         assert!(out.is_empty(), "incompatible event must not be rendered");
@@ -431,6 +646,12 @@ mod tests {
                 session: None,
                 fork: true,
                 exec: None,
+                format: "default".into(),
+                thinking: false,
+                title: None,
+                variant: None,
+                auto: false,
+                yolo: false,
             },
             channel,
         )
