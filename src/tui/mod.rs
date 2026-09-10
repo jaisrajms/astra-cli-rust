@@ -32,7 +32,7 @@ use astra_proto::astra::engine::v1::{
 };
 use astra_proto::SessionId;
 
-use self::app::App;
+use self::app::{App, Prompt};
 use self::stream::DaemonEvent;
 
 /// Enter the full-screen TUI. Blocks until the user quits (Ctrl-C / `q` / Esc)
@@ -129,23 +129,68 @@ async fn handle_terminal_event(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_quit();
         }
-        // Match the reference CLI: `q` quits only when the prompt is empty.
-        KeyCode::Char('q') if app.input.is_empty() => {
-            app.request_quit();
-        }
-        KeyCode::Esc => app.request_quit(),
-        KeyCode::Enter => {
-            if let Some(content) = app.submit() {
-                let agent = app.current_agent().to_string();
-                app.begin_turn(content.clone());
-                let sid = session_id.lock().unwrap().clone();
-                sink.send(build_send_message(sid, content, &agent))
-                    .await
-                    .context("chat stream closed")?;
+        KeyCode::Esc => {
+            let sid = session_id.lock().unwrap().clone();
+            match app.pending.clone() {
+                Some(Prompt::Permission { .. }) => {
+                    if let Some(msg) = app.resolve_permission(false, sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
+                Some(Prompt::Question { .. }) => {
+                    if let Some(msg) = app.resolve_question(String::new(), sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
+                None => app.request_quit(),
             }
         }
-        KeyCode::Tab => app.next_agent(),
-        KeyCode::BackTab => app.prev_agent(),
+        KeyCode::Enter => {
+            let sid = session_id.lock().unwrap().clone();
+            match app.pending.clone() {
+                Some(Prompt::Permission { .. }) => {
+                    if let Some(msg) = app.resolve_permission(true, sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
+                Some(Prompt::Question { .. }) => {
+                    let answer = app.input.trim().to_string();
+                    app.input.clear();
+                    app.cursor = 0;
+                    if let Some(msg) = app.resolve_question(answer, sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
+                None => {
+                    if let Some(content) = app.submit() {
+                        let agent = app.current_agent().to_string();
+                        app.begin_turn(content.clone());
+                        let sid = session_id.lock().unwrap().clone();
+                        sink.send(build_send_message(sid, content, &agent))
+                            .await
+                            .context("chat stream closed")?;
+                    }
+                }
+            }
+        }
+        KeyCode::Char('y') if matches!(app.pending, Some(Prompt::Permission { .. })) => {
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_permission(true, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        KeyCode::Char('n') if matches!(app.pending, Some(Prompt::Permission { .. })) => {
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_permission(false, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        // Match the reference CLI: `q` quits only when the prompt is empty.
+        KeyCode::Char('q') if app.input.is_empty() && app.pending.is_none() => {
+            app.request_quit();
+        }
+        KeyCode::Tab if app.pending.is_none() => app.next_agent(),
+        KeyCode::BackTab if app.pending.is_none() => app.prev_agent(),
         KeyCode::Left => app.cursor_left(),
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),

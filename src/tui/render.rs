@@ -36,7 +36,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_history(frame, app, chunks[1]);
     render_tool_status(frame, app, chunks[2]);
     render_agent_tabs(frame, app, chunks[3]);
-    render_input(frame, app, chunks[4]);
+    match &app.pending {
+        Some(_) => render_prompt(frame, app, chunks[4]),
+        None => render_input(frame, app, chunks[4]),
+    }
     render_help(frame, chunks[5]);
 }
 
@@ -205,6 +208,61 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let line = Line::from(Span::styled(HELP, Style::default().fg(Color::DarkGray)));
     let paragraph = Paragraph::new(line).alignment(Alignment::Center);
     frame.render_widget(paragraph, area);
+}
+
+fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    use super::app::Prompt;
+
+    let (title, hint, show_input) = match &app.pending {
+        Some(Prompt::Permission { tool, summary, .. }) => (
+            format!("△ Permission required — {tool}: {summary}"),
+            "[Enter]/[y] allow   [Esc]/[n] deny".to_string(),
+            false,
+        ),
+        Some(Prompt::Question {
+            question, options, ..
+        }) => {
+            let opts = if options.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", options.join(" / "))
+            };
+            (
+                format!("? {question}{opts}"),
+                "[Enter] answer   [Esc] dismiss".to_string(),
+                true,
+            )
+        }
+        None => return,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" confirm ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().fg(Color::Yellow).bold(),
+    ))];
+    if show_input {
+        let text = format!("❯ {}", app.input);
+        lines.push(Line::from(Span::raw(text)));
+    }
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray).italic(),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    if show_input {
+        let prefix = "❯ ";
+        let cursor_x =
+            inner.x + (prefix.chars().count() + app.cursor).min(inner.width as usize) as u16;
+        frame.set_cursor_position((cursor_x, inner.y + 1));
+    }
 }
 
 #[cfg(test)]

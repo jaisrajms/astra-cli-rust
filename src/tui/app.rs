@@ -14,7 +14,10 @@
 //! a history item at the next tool/control boundary, so a long stream never
 //! triggers a redraw-from-scratch.
 
-use astra_proto::astra::engine::v1::{agent_event, chat_event, AgentEvent, ChatEvent};
+use astra_proto::astra::engine::v1::{
+    agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent, ResolveAskUser,
+    ResolveToolPermission, SessionId,
+};
 
 /// Braille spinner frames, indexed by [`App::tick`].
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -54,6 +57,23 @@ pub enum Item {
     Done(String),
 }
 
+/// An interactive request the daemon parked, waiting for the user's answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prompt {
+    /// A tool-permission escalation: approve or deny the pending tool call.
+    Permission {
+        id: String,
+        tool: String,
+        summary: String,
+    },
+    /// An ask-user question: answer with free text or a selected option label.
+    Question {
+        id: String,
+        question: String,
+        options: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     /// Agent names offered by the picker (already de-duplicated/sorted).
@@ -71,6 +91,8 @@ pub struct App {
     pub running: bool,
     pub error: Option<String>,
     pub title: Option<String>,
+    /// The active interactive prompt (permission / ask-user), if any.
+    pub pending: Option<Prompt>,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
@@ -96,6 +118,7 @@ impl App {
             running: false,
             error: None,
             title: None,
+            pending: None,
             quit: false,
             tick: 0,
         }
@@ -207,6 +230,47 @@ impl App {
         self.quit = true;
     }
 
+    /// Resolve the pending permission prompt: `allow` true → allow, false → deny. Returns the
+    /// resolver message to send, or `None` when there is no pending permission prompt.
+    pub fn resolve_permission(
+        &mut self,
+        allow: bool,
+        session_id: Option<String>,
+    ) -> Option<ChatClientMsg> {
+        let Some(Prompt::Permission { id, .. }) = self.pending.take() else {
+            return None;
+        };
+        Some(ChatClientMsg {
+            session_id: session_id.map(|v| SessionId { value: v }),
+            payload: Some(chat_client_msg::Payload::ResolveToolPermission(
+                ResolveToolPermission {
+                    id,
+                    allow,
+                    persist: String::new(),
+                },
+            )),
+        })
+    }
+
+    /// Resolve the pending ask-user prompt with a free-text answer. Returns the resolver message,
+    /// or `None` when there is no pending question.
+    pub fn resolve_question(
+        &mut self,
+        answer: String,
+        session_id: Option<String>,
+    ) -> Option<ChatClientMsg> {
+        let Some(Prompt::Question { id, .. }) = self.pending.take() else {
+            return None;
+        };
+        Some(ChatClientMsg {
+            session_id: session_id.map(|v| SessionId { value: v }),
+            payload: Some(chat_client_msg::Payload::ResolveAskUser(ResolveAskUser {
+                id,
+                answer,
+            })),
+        })
+    }
+
     // --- daemon events ---
 
     /// Apply one multiplexed [`ChatEvent`]: forwards agent events to
@@ -234,6 +298,22 @@ impl App {
             }
             Some(chat_event::Payload::SessionEnded(_)) => {
                 self.running = false;
+            }
+            Some(chat_event::Payload::ToolPermissionRequest(r)) => {
+                self.flush_streaming();
+                self.pending = Some(Prompt::Permission {
+                    id: r.id.clone(),
+                    tool: r.tool_name.clone(),
+                    summary: r.summary.clone(),
+                });
+            }
+            Some(chat_event::Payload::AskUserRequest(r)) => {
+                self.flush_streaming();
+                self.pending = Some(Prompt::Question {
+                    id: r.id.clone(),
+                    question: r.question.clone(),
+                    options: r.options.clone(),
+                });
             }
             _ => {}
         }
@@ -592,5 +672,63 @@ mod tests {
 
         assert!(app.items.is_empty(), "unknown event must not add history");
         assert!(app.streaming.is_empty());
+    }
+
+    #[test]
+    fn permission_request_parks_and_resolves() {
+        use astra_proto::astra::engine::v1::{chat_event, ChatEvent, ToolPermissionRequest};
+        let mut app = App::new(vec!["build".into()]);
+
+        let event = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::ToolPermissionRequest(
+                ToolPermissionRequest {
+                    id: "p1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "Bash command".into(),
+                    prefix: String::new(),
+                },
+            )),
+        };
+        app.apply_chat_event(&event);
+        assert!(matches!(app.pending, Some(Prompt::Permission { .. })));
+
+        let msg = app
+            .resolve_permission(true, Some("s1".into()))
+            .expect("resolver");
+        assert!(matches!(
+            msg.payload,
+            Some(chat_client_msg::Payload::ResolveToolPermission(r)) if r.allow
+        ));
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn ask_user_request_parks_and_resolves() {
+        use astra_proto::astra::engine::v1::{chat_event, AskUserRequest, ChatEvent};
+        let mut app = App::new(vec!["build".into()]);
+
+        let event = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AskUserRequest(AskUserRequest {
+                id: "q1".into(),
+                question: "Which?".into(),
+                options: vec!["A".into(), "B".into()],
+                header: None,
+                multi_select: false,
+                descriptions: vec![],
+            })),
+        };
+        app.apply_chat_event(&event);
+        assert!(matches!(app.pending, Some(Prompt::Question { .. })));
+
+        let msg = app
+            .resolve_question("B".into(), Some("s1".into()))
+            .expect("resolver");
+        assert!(matches!(
+            msg.payload,
+            Some(chat_client_msg::Payload::ResolveAskUser(r)) if r.answer == "B"
+        ));
+        assert!(app.pending.is_none());
     }
 }
