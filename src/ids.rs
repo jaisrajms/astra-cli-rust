@@ -2,15 +2,6 @@
 
 use astra_proto::astra::engine::v1::ModelRef;
 
-/// A fresh, timestamp-derived session id for a brand-new session.
-pub fn fresh_session_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("s-{nanos}")
-}
-
 /// Parse a `provider/model` spec into a [`ModelRef`]. A bare name becomes a
 /// model id with an empty provider.
 pub fn parse_model(spec: &str) -> ModelRef {
@@ -39,10 +30,5 @@ mod tests {
         let m = parse_model("claude");
         assert_eq!(m.provider_id, "");
         assert_eq!(m.model_id, "claude");
-    }
-
-    #[test]
-    fn fresh_session_id_is_prefixed() {
-        assert!(fresh_session_id().starts_with("s-"));
     }
 }
