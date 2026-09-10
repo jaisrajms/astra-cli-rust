@@ -3,6 +3,9 @@
 use anyhow::Context;
 use clap::Args;
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     session_service_client::SessionServiceClient, ImportSessionRequest,
@@ -20,10 +23,10 @@ pub async fn handle(args: ImportArgs, channel: Channel) -> anyhow::Result<()> {
 
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .import_session(ImportSessionRequest {
+        .import_session(with_workspace(Request::new(ImportSessionRequest {
             payload,
             workspace_id: None,
-        })
+        })))
         .await?
         .into_inner();
 

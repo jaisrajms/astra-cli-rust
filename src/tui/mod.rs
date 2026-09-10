@@ -12,19 +12,23 @@ pub mod app;
 pub mod render;
 mod stream;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 
 use astra_proto::astra::engine::v1::agent_service_client::AgentServiceClient;
 use astra_proto::astra::engine::v1::{
-    chat_client_msg, ChatClientMsg, ListAgentsRequest, SendMessage,
+    chat_client_msg, chat_event, ChatClientMsg, ListAgentsRequest, SendMessage,
 };
 use astra_proto::SessionId;
 
@@ -46,7 +50,8 @@ async fn run_inner(
 ) -> anyhow::Result<()> {
     let agents = load_agents(&channel).await;
     let mut app = App::new(agents);
-    let session_id = crate::ids::fresh_session_id();
+    // Fresh session: `None` until the daemon's `SessionStarted` event returns the real id.
+    let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Open the persistent bidi chat stream up front; a failure here surfaces as
     // a clean error before the UI paints anything.
@@ -67,7 +72,15 @@ async fn run_inner(
             }
             chat_event = event_rx.recv() => {
                 match chat_event {
-                    Some(DaemonEvent::Event(event)) => app.apply_chat_event(&event),
+                    Some(DaemonEvent::Event(event)) => {
+                        // Capture the real session id the daemon assigns on first create.
+                        if let Some(chat_event::Payload::SessionStarted(_)) = &event.payload {
+                            if let Some(sid) = &event.session_id {
+                                *session_id.lock().unwrap() = Some(sid.value.clone());
+                            }
+                        }
+                        app.apply_chat_event(&event)
+                    }
                     // The daemon closed the stream cleanly.
                     Some(DaemonEvent::Closed) | None => break,
                     // The daemon died mid-stream: surface it, then stop.
@@ -102,7 +115,7 @@ async fn handle_terminal_event(
     app: &mut App,
     event: Event,
     sink: &mpsc::Sender<ChatClientMsg>,
-    session_id: &str,
+    session_id: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
     let Event::Key(key) = event else {
         return Ok(());
@@ -125,7 +138,8 @@ async fn handle_terminal_event(
             if let Some(content) = app.submit() {
                 let agent = app.current_agent().to_string();
                 app.begin_turn(content.clone());
-                sink.send(build_send_message(session_id, content, &agent))
+                let sid = session_id.lock().unwrap().clone();
+                sink.send(build_send_message(sid, content, &agent))
                     .await
                     .context("chat stream closed")?;
             }
@@ -145,11 +159,9 @@ async fn handle_terminal_event(
     Ok(())
 }
 
-fn build_send_message(session_id: &str, content: String, agent: &str) -> ChatClientMsg {
+fn build_send_message(session_id: Option<String>, content: String, agent: &str) -> ChatClientMsg {
     ChatClientMsg {
-        session_id: Some(SessionId {
-            value: session_id.to_string(),
-        }),
+        session_id: session_id.map(|v| SessionId { value: v }),
         payload: Some(chat_client_msg::Payload::SendMessage(SendMessage {
             content,
             agent: agent.to_string(),
@@ -164,7 +176,10 @@ fn build_send_message(session_id: &str, content: String, agent: &str) -> ChatCli
 /// when the daemon is unreachable or returns none.
 async fn load_agents(channel: &Channel) -> Vec<String> {
     let mut client = AgentServiceClient::new(channel.clone());
-    let Ok(resp) = client.list_agents(ListAgentsRequest {}).await else {
+    let Ok(resp) = client
+        .list_agents(with_workspace(Request::new(ListAgentsRequest {})))
+        .await
+    else {
         return app::DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect();
     };
 
@@ -191,7 +206,7 @@ mod tests {
 
     #[test]
     fn build_send_message_carries_content_and_agent() {
-        let msg = build_send_message("s-1", "hello".into(), "plan");
+        let msg = build_send_message(Some("s-1".into()), "hello".into(), "plan");
         assert_eq!(msg.session_id.as_ref().unwrap().value, "s-1");
         match msg.payload {
             Some(chat_client_msg::Payload::SendMessage(sm)) => {
@@ -219,7 +234,7 @@ mod tests {
                     KeyModifiers::NONE,
                 )),
                 &sink,
-                "s-9",
+                &Arc::new(Mutex::new(Some("s-9".to_string()))),
             )
             .await
             .unwrap();
@@ -251,7 +266,7 @@ mod tests {
                     KeyModifiers::CONTROL,
                 )),
                 &sink,
-                "s",
+                &Arc::new(Mutex::new(None)),
             )
             .await
             .unwrap();
@@ -267,7 +282,7 @@ mod tests {
                     KeyModifiers::NONE,
                 )),
                 &sink,
-                "s",
+                &Arc::new(Mutex::new(None)),
             )
             .await
             .unwrap();
@@ -290,7 +305,7 @@ mod tests {
                     KeyModifiers::NONE,
                 )),
                 &sink,
-                "s",
+                &Arc::new(Mutex::new(None)),
             )
             .await
             .unwrap();

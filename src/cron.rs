@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::fleet_service_client::FleetServiceClient;
 use astra_proto::astra::engine::v1::{CronCreateRequest, CronDeleteRequest, CronListRequest};
@@ -50,10 +53,10 @@ pub async fn handle(args: CronArgs, channel: Channel) -> anyhow::Result<()> {
 async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     let resp = client
-        .cron_create(CronCreateRequest {
+        .cron_create(with_workspace(Request::new(CronCreateRequest {
             schedule: args.schedule,
             prompt: args.prompt,
-        })
+        })))
         .await?
         .into_inner();
 
@@ -68,7 +71,10 @@ async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
 
 async fn list(channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
-    let resp = client.cron_list(CronListRequest {}).await?.into_inner();
+    let resp = client
+        .cron_list(with_workspace(Request::new(CronListRequest {})))
+        .await?
+        .into_inner();
 
     let rows: Vec<Vec<String>> = resp
         .entries
@@ -90,9 +96,9 @@ async fn list(channel: Channel) -> anyhow::Result<()> {
 async fn delete(args: DeleteArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     client
-        .cron_delete(CronDeleteRequest {
+        .cron_delete(with_workspace(Request::new(CronDeleteRequest {
             id: args.id.clone(),
-        })
+        })))
         .await?;
     println!("Deleted cron {}", args.id);
     Ok(())

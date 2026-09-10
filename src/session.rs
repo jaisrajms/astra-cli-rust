@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     session_service_client::SessionServiceClient, DeleteSessionRequest, ForkSessionRequest,
@@ -85,10 +88,10 @@ pub async fn handle(args: SessionArgs, channel: Channel) -> anyhow::Result<()> {
 async fn list(args: ListArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .list_sessions(ListSessionsRequest {
+        .list_sessions(with_workspace(Request::new(ListSessionsRequest {
             workspace_id: None,
             limit: args.max_count,
-        })
+        })))
         .await?
         .into_inner();
 
@@ -134,14 +137,14 @@ async fn list(args: ListArgs, channel: Channel) -> anyhow::Result<()> {
 async fn fork(args: ForkArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .fork_session(ForkSessionRequest {
+        .fork_session(with_workspace(Request::new(ForkSessionRequest {
             session_id: Some(SessionId {
                 value: args.session_id,
             }),
             message_id: Some(MessageId {
                 value: args.message.unwrap_or_default(),
             }),
-        })
+        })))
         .await?
         .into_inner();
 
@@ -154,11 +157,11 @@ async fn fork(args: ForkArgs, channel: Channel) -> anyhow::Result<()> {
 async fn resume(args: ResumeArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .resume_session(ResumeSessionRequest {
+        .resume_session(with_workspace(Request::new(ResumeSessionRequest {
             session_id: Some(SessionId {
                 value: args.session_id,
             }),
-        })
+        })))
         .await?
         .into_inner();
 
@@ -171,11 +174,11 @@ async fn resume(args: ResumeArgs, channel: Channel) -> anyhow::Result<()> {
 async fn delete(args: DeleteArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = SessionServiceClient::new(channel);
     client
-        .delete_session(DeleteSessionRequest {
+        .delete_session(with_workspace(Request::new(DeleteSessionRequest {
             session_id: Some(SessionId {
                 value: args.session_id.clone(),
             }),
-        })
+        })))
         .await?;
     println!("Session {} deleted", args.session_id);
     Ok(())

@@ -7,6 +7,8 @@ use clap::Args;
 use tonic::transport::Channel;
 use tonic::Request;
 
+use crate::endpoint::with_workspace;
+
 use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::session_service_client::SessionServiceClient;
 use astra_proto::astra::engine::v1::{
@@ -46,7 +48,7 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
 
     let mut chat = ChatServiceClient::new(channel);
     let msg = ChatClientMsg {
-        session_id: Some(SessionId { value: session_id }),
+        session_id: session_id.map(|v| SessionId { value: v }),
         payload: Some(chat_client_msg::Payload::SendMessage(SendMessage {
             content: message,
             agent: args.agent.unwrap_or_else(|| "build".to_string()),
@@ -57,7 +59,9 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
     };
 
     let outbound = futures::stream::iter(std::iter::once(msg));
-    let resp = chat.stream_chat(Request::new(outbound)).await?;
+    let resp = chat
+        .stream_chat(with_workspace(Request::new(outbound)))
+        .await?;
     let stream = resp.into_inner();
 
     consume_stream(stream, std::io::stdout(), std::io::stderr()).await
@@ -100,40 +104,41 @@ async fn resolve_message(args: &RunArgs) -> anyhow::Result<String> {
     Ok(buf.trim_end().to_string())
 }
 
-async fn resolve_session(args: &RunArgs, channel: Channel) -> anyhow::Result<String> {
+async fn resolve_session(args: &RunArgs, channel: Channel) -> anyhow::Result<Option<String>> {
     if args.fork && !args.r#continue && args.session.is_none() {
         anyhow::bail!("--fork requires --continue or --session");
     }
 
     if let Some(id) = &args.session {
         if args.fork {
-            return fork_session(id, channel).await;
+            return Ok(Some(fork_session(id, channel).await?));
         }
-        return Ok(id.clone());
+        return Ok(Some(id.clone()));
     }
 
     if args.r#continue {
         let id = most_recent_root_session(channel.clone()).await?;
         if args.fork {
-            return fork_session(&id, channel).await;
+            return Ok(Some(fork_session(&id, channel).await?));
         }
-        return Ok(id);
+        return Ok(Some(id));
     }
 
-    Ok(crate::ids::fresh_session_id())
+    // Fresh session: an absent session id lets the daemon create the session and return its id.
+    Ok(None)
 }
 
 async fn fork_session(id: &str, channel: Channel) -> anyhow::Result<String> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .fork_session(ForkSessionRequest {
+        .fork_session(with_workspace(Request::new(ForkSessionRequest {
             session_id: Some(SessionId {
                 value: id.to_string(),
             }),
             message_id: Some(MessageId {
                 value: String::new(),
             }),
-        })
+        })))
         .await?
         .into_inner();
 
@@ -145,10 +150,10 @@ async fn fork_session(id: &str, channel: Channel) -> anyhow::Result<String> {
 async fn most_recent_root_session(channel: Channel) -> anyhow::Result<String> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .list_sessions(ListSessionsRequest {
+        .list_sessions(with_workspace(Request::new(ListSessionsRequest {
             workspace_id: None,
             limit: None,
-        })
+        })))
         .await?
         .into_inner();
 

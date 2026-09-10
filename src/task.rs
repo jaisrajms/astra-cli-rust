@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::fleet_service_client::FleetServiceClient;
 use astra_proto::astra::engine::v1::{
@@ -65,11 +68,11 @@ pub async fn handle(args: TaskArgs, channel: Channel) -> anyhow::Result<()> {
 async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     let resp = client
-        .task_create(TaskCreateRequest {
+        .task_create(with_workspace(Request::new(TaskCreateRequest {
             prompt: args.prompt,
             description: args.description,
             team_id: args.team,
-        })
+        })))
         .await?
         .into_inner();
 
@@ -81,7 +84,10 @@ async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
 
 async fn list(channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
-    let resp = client.task_list(TaskListRequest {}).await?.into_inner();
+    let resp = client
+        .task_list(with_workspace(Request::new(TaskListRequest {})))
+        .await?
+        .into_inner();
 
     let rows: Vec<Vec<String>> = resp
         .tasks
@@ -103,9 +109,9 @@ async fn list(channel: Channel) -> anyhow::Result<()> {
 async fn output(args: OutputArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     let resp = client
-        .task_output(TaskOutputRequest {
+        .task_output(with_workspace(Request::new(TaskOutputRequest {
             task_id: args.task_id,
-        })
+        })))
         .await?
         .into_inner();
 
@@ -124,9 +130,9 @@ async fn output(args: OutputArgs, channel: Channel) -> anyhow::Result<()> {
 async fn stop(args: StopArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     let resp = client
-        .task_stop(TaskStopRequest {
+        .task_stop(with_workspace(Request::new(TaskStopRequest {
             task_id: args.task_id.clone(),
-        })
+        })))
         .await?
         .into_inner();
 

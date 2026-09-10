@@ -6,6 +6,7 @@
 //! the mock-server tests). A leading `~` in a socket path is expanded.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -69,6 +70,28 @@ pub fn connect(endpoint: &str) -> anyhow::Result<Channel> {
             }
         }));
     Ok(channel)
+}
+
+/// The workspace root the CLI targets: the `ASTRA_WORKSPACE` env var, else the current directory.
+/// The daemon is per-workspace, so every workspace-scoped request must carry this.
+pub fn workspace_root() -> String {
+    std::env::var("ASTRA_WORKSPACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+}
+
+/// Attach the `workspace-root` gRPC metadata to a request so the daemon resolves the per-workspace
+/// engine. Best-effort: a non-ASCII path that can't be encoded as a metadata value is left unset.
+pub fn with_workspace<T>(mut req: tonic::Request<T>) -> tonic::Request<T> {
+    if let Ok(v) = tonic::metadata::MetadataValue::from_str(&workspace_root()) {
+        req.metadata_mut().insert("workspace-root", v);
+    }
+    req
 }
 
 /// Dial a Windows named pipe (`\\.\pipe\...`) via `tokio`'s `NamedPipeClient`.

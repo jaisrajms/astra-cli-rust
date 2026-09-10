@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     mcp_service_client::McpServiceClient, ConfigureServerRequest, ConnectServerRequest,
@@ -61,7 +64,7 @@ pub async fn handle(args: McpArgs, channel: Channel) -> anyhow::Result<()> {
 async fn list(channel: Channel) -> anyhow::Result<()> {
     let mut client = McpServiceClient::new(channel);
     let resp = client
-        .list_servers(ListServersRequest {})
+        .list_servers(with_workspace(Request::new(ListServersRequest {})))
         .await?
         .into_inner();
 
@@ -84,9 +87,9 @@ async fn list(channel: Channel) -> anyhow::Result<()> {
 async fn connect(args: ConnectArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = McpServiceClient::new(channel);
     let resp = client
-        .connect_server(ConnectServerRequest {
+        .connect_server(with_workspace(Request::new(ConnectServerRequest {
             name: args.name.clone(),
-        })
+        })))
         .await?
         .into_inner();
 
@@ -100,13 +103,13 @@ async fn connect(args: ConnectArgs, channel: Channel) -> anyhow::Result<()> {
 async fn configure(args: ConfigureArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = McpServiceClient::new(channel);
     let resp = client
-        .configure_server(ConfigureServerRequest {
+        .configure_server(with_workspace(Request::new(ConfigureServerRequest {
             name: args.name.clone(),
             kind: args.kind,
             url: args.url,
             command: args.command,
             oauth: args.oauth,
-        })
+        })))
         .await?
         .into_inner();
 

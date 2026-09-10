@@ -4,6 +4,8 @@ use clap::{Args, ValueEnum};
 use tonic::transport::Channel;
 use tonic::Request;
 
+use crate::endpoint::with_workspace;
+
 use astra_proto::astra::engine::v1::workflow_service_client::WorkflowServiceClient;
 use astra_proto::astra::engine::v1::{
     client_msg, engine_event, ClientMsg, EngineEvent, StartFull, StartQuick, WorkflowStateName,
@@ -43,7 +45,9 @@ pub async fn handle(args: WorkflowArgs, channel: Channel) -> anyhow::Result<()> 
 
     let mut client = WorkflowServiceClient::new(channel);
     let outbound = futures::stream::iter(std::iter::once(msg));
-    let resp = client.stream_workflow(Request::new(outbound)).await?;
+    let resp = client
+        .stream_workflow(with_workspace(Request::new(outbound)))
+        .await?;
     let mut stream = resp.into_inner();
 
     while let Some(event) = stream.message().await? {

@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     agent_service_client::AgentServiceClient, Agent, AgentMode, CreateAgentRequest,
@@ -60,7 +63,10 @@ pub async fn handle(args: AgentArgs, channel: Channel) -> anyhow::Result<()> {
 
 async fn list(channel: Channel) -> anyhow::Result<()> {
     let mut client = AgentServiceClient::new(channel);
-    let resp = client.list_agents(ListAgentsRequest {}).await?.into_inner();
+    let resp = client
+        .list_agents(with_workspace(Request::new(ListAgentsRequest {})))
+        .await?
+        .into_inner();
 
     let mut agents = resp.agents;
     agents.sort_by(|a, b| a.name.cmp(&b.name));
@@ -106,7 +112,9 @@ async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
 
     let mut client = AgentServiceClient::new(channel);
     let resp = client
-        .create_agent(CreateAgentRequest { agent: Some(agent) })
+        .create_agent(with_workspace(Request::new(CreateAgentRequest {
+            agent: Some(agent),
+        })))
         .await?
         .into_inner();
 

@@ -2,6 +2,9 @@
 
 use clap::{Args, Subcommand};
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::fleet_service_client::FleetServiceClient;
 use astra_proto::astra::engine::v1::{TeamCreateRequest, TeamListRequest};
@@ -37,9 +40,9 @@ pub async fn handle(args: TeamArgs, channel: Channel) -> anyhow::Result<()> {
 async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
     let resp = client
-        .team_create(TeamCreateRequest {
+        .team_create(with_workspace(Request::new(TeamCreateRequest {
             prompts: args.prompts,
-        })
+        })))
         .await?
         .into_inner();
 
@@ -56,7 +59,10 @@ async fn create(args: CreateArgs, channel: Channel) -> anyhow::Result<()> {
 
 async fn list(channel: Channel) -> anyhow::Result<()> {
     let mut client = FleetServiceClient::new(channel);
-    let resp = client.team_list(TeamListRequest {}).await?.into_inner();
+    let resp = client
+        .team_list(with_workspace(Request::new(TeamListRequest {})))
+        .await?
+        .into_inner();
 
     let rows: Vec<Vec<String>> = resp
         .teams

@@ -5,6 +5,9 @@ use std::io::Write;
 use anyhow::Context;
 use clap::Args;
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     session_service_client::SessionServiceClient, ExportSessionRequest, ListSessionsRequest,
@@ -29,9 +32,9 @@ pub async fn handle(args: ExportArgs, channel: Channel) -> anyhow::Result<()> {
 
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .export_session(ExportSessionRequest {
+        .export_session(with_workspace(Request::new(ExportSessionRequest {
             session_id: Some(SessionId { value: session_id }),
-        })
+        })))
         .await?
         .into_inner();
 
@@ -54,10 +57,10 @@ pub async fn handle(args: ExportArgs, channel: Channel) -> anyhow::Result<()> {
 async fn most_recent_session_id(channel: Channel) -> anyhow::Result<String> {
     let mut client = SessionServiceClient::new(channel);
     let resp = client
-        .list_sessions(ListSessionsRequest {
+        .list_sessions(with_workspace(Request::new(ListSessionsRequest {
             workspace_id: None,
             limit: None,
-        })
+        })))
         .await?
         .into_inner();
 

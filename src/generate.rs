@@ -2,6 +2,9 @@
 
 use clap::Args;
 use tonic::transport::Channel;
+use tonic::Request;
+
+use crate::endpoint::with_workspace;
 
 use astra_proto::astra::engine::v1::{
     agent_service_client::AgentServiceClient, GenerateAgentRequest,
@@ -20,10 +23,10 @@ pub struct GenerateArgs {
 pub async fn handle(args: GenerateArgs, channel: Channel) -> anyhow::Result<()> {
     let mut client = AgentServiceClient::new(channel);
     let resp = client
-        .generate_agent(GenerateAgentRequest {
+        .generate_agent(with_workspace(Request::new(GenerateAgentRequest {
             description: args.description,
             model: args.model.as_deref().map(crate::ids::parse_model),
-        })
+        })))
         .await?
         .into_inner();
 

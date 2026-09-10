@@ -11,6 +11,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
 
+use crate::endpoint::with_workspace;
+
 use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::{ChatClientMsg, ChatEvent};
 
@@ -37,7 +39,9 @@ pub async fn spawn(
     let (event_tx, event_rx) = mpsc::channel::<DaemonEvent>(512);
 
     let request_stream = ReceiverStream::new(outbound_rx);
-    let response = client.stream_chat(Request::new(request_stream)).await?;
+    let response = client
+        .stream_chat(with_workspace(Request::new(request_stream)))
+        .await?;
     let mut inbound = response.into_inner();
 
     // Pump inbound events to the UI. The task ends when the daemon closes the
