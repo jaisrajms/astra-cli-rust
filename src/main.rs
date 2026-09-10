@@ -82,8 +82,8 @@ async fn dispatch(command: Command, channel: tonic::transport::Channel) -> anyho
         Command::Team(args) => team::handle(args, channel).await,
         Command::Cron(args) => cron::handle(args, channel).await,
         Command::Workflow(args) => workflow::handle(args, channel).await,
-        Command::Config(args) => config::handle(args).await,
-        Command::Auth(args) => auth::handle(args).await,
+        Command::Config(args) => config::handle(args, channel).await,
+        Command::Auth(args) => auth::handle(args, channel).await,
         Command::Doctor(args) => doctor::handle(args, channel).await,
     }
 }

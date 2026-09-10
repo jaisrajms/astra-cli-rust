@@ -68,7 +68,7 @@ pub enum Command {
     Cron(CronArgs),
     /// Drive a workflow over the engine's workflow stream.
     Workflow(WorkflowArgs),
-    /// Read/write local CLI configuration.
+    /// Read/write daemon configuration.
     Config(ConfigArgs),
     /// Manage daemon authentication.
     Auth(AuthArgs),

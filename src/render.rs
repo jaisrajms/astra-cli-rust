@@ -2,6 +2,12 @@
 
 /// Render an aligned plain-text table with a header row and a `─` separator.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) {
+    print!("{}", table_string(headers, rows));
+}
+
+/// Build the same aligned table as a string (trailing newline included), so
+/// callers can render to a buffer or assert on it in tests.
+pub fn table_string(headers: &[&str], rows: &[Vec<String>]) -> String {
     let cols = headers.len();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
 
@@ -11,6 +17,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
         }
     }
 
+    let mut out = String::new();
     let mut header = String::new();
     for (i, h) in headers.iter().enumerate() {
         header.push_str(&pad(h, widths[i]));
@@ -18,8 +25,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
             header.push_str("  ");
         }
     }
-    println!("{header}");
-    println!("{}", "─".repeat(header.chars().count()));
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&"─".repeat(header.chars().count()));
+    out.push('\n');
 
     for row in rows {
         let mut line = String::new();
@@ -29,8 +38,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
                 line.push_str("  ");
             }
         }
-        println!("{line}");
+        out.push_str(&line);
+        out.push('\n');
     }
+    out
 }
 
 fn pad(s: &str, width: usize) -> String {

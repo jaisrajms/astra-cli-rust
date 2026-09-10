@@ -95,6 +95,7 @@ dependencies = [
  "hyper-util",
  "ratatui",
  "serde_json",
+ "termios",
  "tokio",
  "tokio-stream",
  "tonic",
