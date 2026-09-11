@@ -584,6 +584,29 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_docks_on_wide_and_hides_on_narrow() {
+        let mut app = App::new(vec!["build".into()]);
+        // Wide (>=120): the sidebar (with its LSP section) is docked on the right.
+        let wide = render_to_string(&mut app, 130, 30);
+        assert!(wide.contains("LSP"), "wide layout should show the sidebar");
+
+        // Narrow (<120): the sidebar is hidden.
+        let narrow = render_to_string(&mut app, 80, 30);
+        assert!(
+            !narrow.contains("LSP"),
+            "narrow layout should hide the sidebar"
+        );
+
+        // Force-docking the sidebar on narrow shows it again.
+        app.ui.sidebar = SidebarMode::Docked;
+        let forced = render_to_string(&mut app, 80, 30);
+        assert!(
+            forced.contains("LSP"),
+            "force-docked sidebar should show on narrow"
+        );
+    }
+
+    #[test]
     fn tool_line_renders_icon_and_label_not_raw_args() {
         let mut app = App::new(vec!["build".into()]);
         app.begin_turn("read a file".into());
