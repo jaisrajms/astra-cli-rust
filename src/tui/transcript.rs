@@ -6,16 +6,20 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::app::{App, Item, ToolOutcome};
+use super::app::{App, Item, RowItem, ToolOutcome};
 use super::theme::Theme;
+use super::tool_output::{collapse_output, strip_ansi};
 use super::wrap::{display_width, wrap_text};
 use crate::tool::{tool_icon, tool_label};
+
+/// The bounded line count for a collapsed shell tool block.
+const SHELL_MAX_LINES: usize = 10;
 
 /// One measured, already-wrapped transcript row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasuredRow {
-    /// The stable id of the item this row belongs to (tool/reasoning), or `None`.
-    pub item_id: Option<String>,
+    /// The item this row belongs to (a tool/reasoning block), or `None`.
+    pub item_id: Option<RowItem>,
     pub line: Line<'static>,
 }
 
@@ -26,8 +30,8 @@ pub fn measure(app: &App, width: u16, theme: Theme) -> Vec<MeasuredRow> {
 
     for item in &app.items {
         let id = match item {
-            Item::ToolCall { id, .. } => Some(id.clone()),
-            Item::Reasoning { id, .. } => Some(id.clone()),
+            Item::ToolCall { id, .. } => Some(RowItem::Tool(id.clone())),
+            Item::Reasoning { id, .. } => Some(RowItem::Reasoning(id.clone())),
             _ => None,
         };
         for line in item_lines(app, item, theme) {
@@ -87,28 +91,21 @@ fn item_lines(app: &App, item: &Item, theme: Theme) -> Vec<Line<'static>> {
         ])],
         Item::Assistant(text) => markdown_lines(text, theme),
         Item::ToolCall {
+            id,
             name,
             input,
             outcome,
-            ..
-        } => tool_lines(app, name, input, outcome.as_ref(), theme),
+        } => tool_lines(app, Some(id), name, input, outcome.as_ref(), theme),
         Item::Notice(text) => vec![Line::from(Span::styled(
             text.clone(),
             Style::default().fg(theme.notice),
         ))],
-        Item::Reasoning { text, .. } => {
-            // Collapsed: a "Thinking" header with a short preview (the reference CLI collapses
-            // reasoning; the body is only shown on expand).
-            let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();
-            let ellipsis = if text.chars().count() > 60 { "…" } else { "" };
-            vec![Line::from(vec![
-                Span::styled(" ✦ Thinking · ", Style::default().fg(theme.dim).italic()),
-                Span::styled(
-                    format!("{preview}{ellipsis}"),
-                    Style::default().fg(theme.dim),
-                ),
-            ])]
-        }
+        Item::Reasoning {
+            id,
+            text,
+            start_ms,
+            end_ms,
+        } => reasoning_lines(app, id, text, *start_ms, *end_ms, theme),
         Item::Error(text) => vec![Line::from(Span::styled(
             format!(" ✗ {text}"),
             Style::default().fg(theme.err),
@@ -120,11 +117,55 @@ fn item_lines(app: &App, item: &Item, theme: Theme) -> Vec<Line<'static>> {
     }
 }
 
+/// The reasoning block: a compact "Thinking" header (with duration when the daemon supplied
+/// timing), plus the full body when expanded.
+fn reasoning_lines(
+    app: &App,
+    id: &str,
+    text: &str,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let duration = match (start_ms, end_ms) {
+        (Some(s), Some(e)) => Some((e.saturating_sub(s)) as f64 / 1000.0),
+        _ => None,
+    };
+    let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+
+    let label = if text.is_empty() {
+        "Thinking".to_string()
+    } else {
+        let mut s = format!("Thinking: {preview}");
+        if text.chars().count() > 60 {
+            s.push('…');
+        }
+        s
+    };
+    let mut spans = vec![Span::styled(" ✦ ", Style::default().fg(theme.dim).italic())];
+    spans.push(Span::styled(label, Style::default().fg(theme.dim)));
+    if let Some(secs) = duration {
+        spans.push(Span::styled(
+            format!(" · {secs:.1}s"),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    let mut lines = vec![Line::from(spans)];
+
+    if app.ui.expanded_reasoning.contains(id) && !text.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(markdown_lines(text, theme));
+    }
+    lines
+}
+
 /// Render a tool call as a single inline row (icon + label), the way the reference CLI does: a
 /// spinner + active color while running, then the tool icon in muted/error color once finished.
-/// `Bash`/`ShellBash` additionally show their output beneath the command line.
+/// `Bash`/`ShellBash` show their (ANSI-stripped, bounded) output beneath the command line, with an
+/// expand/collapse affordance keyed by the tool's stable id.
 fn tool_lines(
     app: &App,
+    id: Option<&str>,
     name: &str,
     input: &str,
     outcome: Option<&ToolOutcome>,
@@ -153,15 +194,38 @@ fn tool_lines(
     ])];
 
     if is_shell {
-        let shown = if out.output.is_empty() {
+        let raw = if out.output.is_empty() {
             out.summary.as_str()
         } else {
             out.output.as_str()
         };
-        for out_line in shown.lines().take(12) {
+        let clean = strip_ansi(raw);
+        let expanded = id
+            .map(|i| app.ui.expanded_tools.contains(i))
+            .unwrap_or(false);
+
+        let (shown, overflow) = if expanded {
+            (clean.clone(), false)
+        } else {
+            let c = collapse_output(&clean, SHELL_MAX_LINES, SHELL_MAX_LINES * 120);
+            (c.output, c.overflow)
+        };
+
+        for out_line in shown.lines() {
             lines.push(Line::from(Span::styled(
                 format!("     {out_line}"),
                 Style::default().fg(color),
+            )));
+        }
+        if expanded {
+            lines.push(Line::from(Span::styled(
+                "     … click to collapse",
+                Style::default().fg(theme.dim).italic(),
+            )));
+        } else if overflow {
+            lines.push(Line::from(Span::styled(
+                "     … click to expand",
+                Style::default().fg(theme.dim).italic(),
             )));
         }
     } else if !out.ok && !out.summary.is_empty() {
@@ -272,4 +336,90 @@ pub(crate) fn inline_spans(text: &str, theme: Theme) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::theme_at;
+
+    fn theme() -> Theme {
+        *theme_at(0)
+    }
+
+    #[test]
+    fn measure_tags_tool_rows_with_row_item() {
+        let mut app = App::new(vec!["build".into()]);
+        app.apply_agent_event(&astra_proto::astra::engine::v1::AgentEvent {
+            kind: Some(astra_proto::astra::engine::v1::agent_event::Kind::ToolCall(
+                astra_proto::astra::engine::v1::ToolCallEvent {
+                    id: "tc".into(),
+                    name: "Read".into(),
+                    input: "{}".into(),
+                },
+            )),
+        });
+        let rows = measure(&app, 60, theme());
+        assert!(matches!(
+            rows[0].item_id,
+            Some(RowItem::Tool(ref id)) if id == "tc"
+        ));
+    }
+
+    #[test]
+    fn shell_output_is_bounded_and_expandable() {
+        let mut app = App::new(vec!["build".into()]);
+        let output = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.items.push(Item::ToolCall {
+            id: "sh".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            outcome: Some(ToolOutcome {
+                ok: true,
+                summary: String::new(),
+                output,
+            }),
+        });
+
+        let collapsed = measure(&app, 60, theme());
+        let text = collapsed
+            .iter()
+            .map(|r| r.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("click to expand"));
+        assert!(!text.contains("line 19"));
+
+        app.ui.expanded_tools.insert("sh".into());
+        let expanded = measure(&app, 60, theme());
+        let text2 = expanded
+            .iter()
+            .map(|r| r.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text2.contains("line 19"));
+        assert!(text2.contains("click to collapse"));
+    }
+
+    #[test]
+    fn reasoning_header_includes_duration_when_present() {
+        let mut app = App::new(vec![]);
+        app.items.push(Item::Reasoning {
+            id: "r".into(),
+            text: "planning the change".into(),
+            start_ms: Some(1000),
+            end_ms: Some(3400),
+        });
+        let rows = measure(&app, 80, theme());
+        let text = rows
+            .iter()
+            .map(|r| r.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Thinking: planning the change"));
+        assert!(text.contains("2.4s"));
+    }
 }

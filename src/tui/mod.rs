@@ -14,6 +14,7 @@ pub mod layout;
 pub mod render;
 mod stream;
 pub mod theme;
+pub mod tool_output;
 pub mod transcript;
 pub mod wrap;
 
@@ -177,6 +178,7 @@ async fn apply_command(
             app.ui.transcript.scroll_to_end(total, viewport);
         }
         UiCommand::Focus(focus) => app.ui.focus = focus,
+        UiCommand::ToggleExpand(item) => app.toggle_expanded(&item),
         UiCommand::Insert(c) => app.push_char(c),
         UiCommand::Backspace => app.backspace(),
         UiCommand::DeleteForward => app.delete_forward(),

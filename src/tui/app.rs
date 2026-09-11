@@ -158,6 +158,9 @@ pub struct UiState {
     pub lsp_enabled: bool,
     /// The last computed layout (ratatui-free rects), for mouse hit-testing in the event layer.
     pub layout: Option<super::layout::Layout>,
+    /// The `RowItem` per visible transcript row (indexed into the current window), set by render and
+    /// read by the event layer to map a click back to the tool/reasoning to expand.
+    pub visible_item_ids: Vec<Option<RowItem>>,
 }
 
 impl Default for UiState {
@@ -174,6 +177,7 @@ impl Default for UiState {
             mcp: Vec::new(),
             lsp_enabled: false,
             layout: None,
+            visible_item_ids: Vec::new(),
         }
     }
 }
@@ -224,6 +228,14 @@ pub enum Item {
 pub struct Todo {
     pub content: String,
     pub status: String,
+}
+
+/// What a measured transcript row maps back to, for click-to-expand hit-testing. A row is either
+/// part of a tool call or a reasoning block (other rows carry `None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowItem {
+    Tool(String),
+    Reasoning(String),
 }
 
 /// An interactive request the daemon parked, waiting for the user's answer.
@@ -383,6 +395,22 @@ impl App {
             None => {
                 if matches!(self.ui.focus, Focus::Popup(_)) {
                     self.ui.focus = Focus::Prompt;
+                }
+            }
+        }
+    }
+
+    /// Toggle whether a tool/reasoning row is expanded past its bounded preview.
+    pub fn toggle_expanded(&mut self, item: &RowItem) {
+        match item {
+            RowItem::Tool(id) => {
+                if !self.ui.expanded_tools.remove(id) {
+                    self.ui.expanded_tools.insert(id.clone());
+                }
+            }
+            RowItem::Reasoning(id) => {
+                if !self.ui.expanded_reasoning.remove(id) {
+                    self.ui.expanded_reasoning.insert(id.clone());
                 }
             }
         }
@@ -1518,6 +1546,22 @@ mod tests {
             app.items.first(),
             Some(Item::ToolCall { id, .. }) if id == "tc-1"
         ));
+    }
+
+    #[test]
+    fn toggle_expanded_flips_tool_and_reasoning_sets() {
+        let mut app = App::new(vec![]);
+        assert!(app.ui.expanded_tools.is_empty());
+
+        app.toggle_expanded(&RowItem::Tool("t".into()));
+        assert!(app.ui.expanded_tools.contains("t"));
+        app.toggle_expanded(&RowItem::Tool("t".into()));
+        assert!(!app.ui.expanded_tools.contains("t"));
+
+        app.toggle_expanded(&RowItem::Reasoning("r".into()));
+        assert!(app.ui.expanded_reasoning.contains("r"));
+        // Tool and reasoning are independent sets.
+        assert!(app.ui.expanded_tools.is_empty());
     }
 
     #[test]

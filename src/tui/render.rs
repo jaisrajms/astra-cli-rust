@@ -127,6 +127,12 @@ fn render_history(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         .take(viewport)
         .map(|r| r.line.clone())
         .collect();
+    app.ui.visible_item_ids = rows
+        .iter()
+        .skip(offset)
+        .take(viewport)
+        .map(|r| r.item_id.clone())
+        .collect();
 
     let paragraph = Paragraph::new(visible)
         .block(Block::default().borders(Borders::ALL).title(" session "))

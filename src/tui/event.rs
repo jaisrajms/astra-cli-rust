@@ -12,7 +12,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use super::app::{App, Focus, Prompt};
+use super::app::{App, Focus, Prompt, RowItem};
 use super::layout::Surface;
 
 /// A local UI command produced by routing one terminal event. `mod.rs` applies it.
@@ -28,6 +28,8 @@ pub enum UiCommand {
     TranscriptEnd,
     /// Move focus to the given surface.
     Focus(Focus),
+    /// Toggle the expansion of a tool/reasoning block.
+    ToggleExpand(RowItem),
     // Prompt editing.
     Insert(char),
     Backspace,
@@ -185,13 +187,25 @@ fn route_mouse(mouse: &MouseEvent, app: &App) -> UiCommand {
             Surface::Transcript => UiCommand::ScrollTranscript(3),
             _ => UiCommand::Noop,
         },
-        // Left click moves focus to the surface under the cursor.
-        MouseEventKind::Down(MouseButton::Left) => match surface {
-            Surface::Transcript => UiCommand::Focus(Focus::Transcript),
-            Surface::Sidebar => UiCommand::Focus(Focus::Sidebar),
-            Surface::Prompt => UiCommand::Focus(Focus::Prompt),
-            Surface::None => UiCommand::Noop,
-        },
+        // Left click: over a tool/reasoning row it toggles expansion; otherwise it moves focus.
+        MouseEventKind::Down(MouseButton::Left) => {
+            if surface == Surface::Transcript {
+                if let Some(layout) = app.ui.layout {
+                    // The transcript inner area starts one row below the block border.
+                    let k = mouse.row.saturating_sub(layout.transcript.y + 1);
+                    if let Some(Some(item)) = app.ui.visible_item_ids.get(k as usize) {
+                        return UiCommand::ToggleExpand(item.clone());
+                    }
+                }
+                UiCommand::Focus(Focus::Transcript)
+            } else {
+                match surface {
+                    Surface::Sidebar => UiCommand::Focus(Focus::Sidebar),
+                    Surface::Prompt => UiCommand::Focus(Focus::Prompt),
+                    _ => UiCommand::Noop,
+                }
+            }
+        }
         _ => UiCommand::Noop,
     }
 }
