@@ -96,6 +96,8 @@ pub struct App {
     pub pending: Option<Prompt>,
     /// The most recent usage sample (input, output, cost) for the footer statusline.
     pub last_usage: Option<(i64, i64, Option<f64>)>,
+    /// Index into the built-in theme list.
+    pub theme_index: usize,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
@@ -125,6 +127,7 @@ impl App {
             title: None,
             pending: None,
             last_usage: None,
+            theme_index: 0,
             quit: false,
             tick: 0,
         }
@@ -269,6 +272,11 @@ impl App {
 
     pub fn request_quit(&mut self) {
         self.quit = true;
+    }
+
+    /// Cycle to the next built-in theme.
+    pub fn next_theme(&mut self) {
+        self.theme_index = (self.theme_index + 1) % super::theme::THEMES.len();
     }
 
     /// Resolve the pending permission prompt: `allow` true → allow, false → deny. Returns the

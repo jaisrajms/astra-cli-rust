@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 use super::app::{App, Item, ToolStatus};
+use super::theme::{theme_at, Theme};
 use crate::tool::{summarize_input, tool_icon};
 
 /// Fixed layout rows (top → bottom): title, history, tool status, agent tabs,
@@ -31,18 +32,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    render_title(frame, app, chunks[0]);
-    render_history(frame, app, chunks[1]);
-    render_tool_status(frame, app, chunks[2]);
-    render_agent_tabs(frame, app, chunks[3]);
+    let theme = *theme_at(app.theme_index);
+
+    render_title(frame, app, chunks[0], theme);
+    render_history(frame, app, chunks[1], theme);
+    render_tool_status(frame, app, chunks[2], theme);
+    render_agent_tabs(frame, app, chunks[3], theme);
     match &app.pending {
-        Some(_) => render_prompt(frame, app, chunks[4]),
-        None => render_input(frame, app, chunks[4]),
+        Some(_) => render_prompt(frame, app, chunks[4], theme),
+        None => render_input(frame, app, chunks[4], theme),
     }
-    render_status(frame, app, chunks[5]);
+    render_status(frame, app, chunks[5], theme);
 }
 
-fn render_title(frame: &mut Frame, app: &App, area: Rect) {
+fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let title = app.title.clone().unwrap_or_else(|| "Astra".to_string());
     let running = if app.running { " ●" } else { "" };
     let block = Block::default()
@@ -50,24 +53,27 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .title_bottom(Line::from(vec![
             Span::raw(" agent: "),
-            Span::styled(app.current_agent(), Style::default().fg(Color::Cyan).bold()),
+            Span::styled(
+                app.current_agent(),
+                Style::default().fg(theme.accent).bold(),
+            ),
             Span::raw(running),
         ]));
     frame.render_widget(block, area);
 }
 
-fn render_history(frame: &mut Frame, app: &App, area: Rect) {
+fn render_history(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.items {
-        lines.extend(item_lines(item));
+        lines.extend(item_lines(item, theme));
     }
     if !app.streaming.is_empty() {
-        lines.extend(markdown_lines(&app.streaming));
+        lines.extend(markdown_lines(&app.streaming, theme));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "No messages yet — type a prompt and press Enter.",
-            Style::default().fg(Color::DarkGray).italic(),
+            Style::default().fg(theme.dim).italic(),
         )));
     }
 
@@ -81,23 +87,23 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn item_lines(item: &Item) -> Vec<Line<'static>> {
+fn item_lines(item: &Item, theme: Theme) -> Vec<Line<'static>> {
     match item {
         Item::User(text) => vec![Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(Color::Cyan).bold()),
+            Span::styled("❯ ", Style::default().fg(theme.accent).bold()),
             Span::raw(text.clone()),
         ])],
-        Item::Assistant(text) => markdown_lines(text),
+        Item::Assistant(text) => markdown_lines(text, theme),
         Item::ToolCall { name, input } => {
             let args = summarize_input(input);
             vec![Line::from(vec![
                 Span::styled(
                     format!(" {} ", tool_icon(name)),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.tool),
                 ),
                 Span::styled(
                     format!("{name}{args}"),
-                    Style::default().fg(Color::Yellow).italic(),
+                    Style::default().fg(theme.tool).italic(),
                 ),
             ])]
         }
@@ -108,13 +114,10 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
             output,
         } => {
             let mark = if *ok { "✓" } else { "✗" };
-            let color = if *ok { Color::Green } else { Color::Red };
+            let color = if *ok { theme.ok } else { theme.err };
             let mut lines = vec![Line::from(vec![
                 Span::styled(format!("   {mark} {name}"), Style::default().fg(color)),
-                Span::styled(
-                    format!(" — {summary}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!(" — {summary}"), Style::default().fg(theme.dim)),
             ])];
             let shown = if output.is_empty() {
                 summary.as_str()
@@ -124,14 +127,14 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
             for out_line in shown.lines().take(6) {
                 lines.push(Line::from(Span::styled(
                     format!("     {out_line}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 )));
             }
             lines
         }
         Item::Notice(text) => vec![Line::from(Span::styled(
             text.clone(),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme.notice),
         ))],
         Item::Reasoning(text) => {
             // Collapsed: a "Thinking" header with a short preview (the reference CLI collapses
@@ -139,23 +142,20 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
             let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();
             let ellipsis = if text.chars().count() > 60 { "…" } else { "" };
             vec![Line::from(vec![
-                Span::styled(
-                    " ✦ Thinking · ",
-                    Style::default().fg(Color::DarkGray).italic(),
-                ),
+                Span::styled(" ✦ Thinking · ", Style::default().fg(theme.dim).italic()),
                 Span::styled(
                     format!("{preview}{ellipsis}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 ),
             ])]
         }
         Item::Error(text) => vec![Line::from(Span::styled(
             format!(" ✗ {text}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.err),
         ))],
         Item::Done(result) => vec![Line::from(Span::styled(
             result.clone(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.accent),
         ))],
     }
 }
@@ -164,7 +164,7 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
 /// (#/##), bullets (- / *), inline code (`) and bold (**) get basic styling; everything else is
 /// plain. This is a lightweight approximation of the reference CLI's markdown renderer (no
 /// full syntax highlighter).
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut code_buf: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
@@ -182,7 +182,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
         if in_code {
             code_buf.push(Line::from(Span::styled(
                 raw.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
             continue;
         }
@@ -195,14 +195,14 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
         if let Some(rest) = body.strip_prefix('#') {
             lines.push(Line::from(Span::styled(
                 rest.trim_start().to_string(),
-                Style::default().fg(Color::Cyan).bold(),
+                Style::default().fg(theme.accent).bold(),
             )));
         } else if let Some(rest) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
-            let mut spans = vec![Span::styled("  • ", Style::default().fg(Color::DarkGray))];
-            spans.extend(inline_spans(rest));
+            let mut spans = vec![Span::styled("  • ", Style::default().fg(theme.dim))];
+            spans.extend(inline_spans(rest, theme));
             lines.push(Line::from(spans));
         } else {
-            lines.push(Line::from(inline_spans(body)));
+            lines.push(Line::from(inline_spans(body, theme)));
         }
     }
     if in_code {
@@ -212,7 +212,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 }
 
 /// Tokenize inline `**bold**` and `` `code` `` spans; other text stays plain.
-fn inline_spans(text: &str) -> Vec<Span<'static>> {
+fn inline_spans(text: &str, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
@@ -243,7 +243,7 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
                 Some(end) => {
                     spans.push(Span::styled(
                         after[..end].to_string(),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme.ok),
                     ));
                     rest = &after[end + 2..];
                 }
@@ -260,24 +260,21 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
     spans
 }
 
-fn render_tool_status(frame: &mut Frame, app: &App, area: Rect) {
+fn render_tool_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let line = match &app.tool {
-        ToolStatus::Idle => Line::from(Span::styled(" idle", Style::default().fg(Color::DarkGray))),
+        ToolStatus::Idle => Line::from(Span::styled(" idle", Style::default().fg(theme.dim))),
         ToolStatus::Running { name, .. } => Line::from(vec![
             Span::styled(
                 format!(" {} ", app.spinner()),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.tool),
             ),
-            Span::styled(
-                format!("running {name}…"),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("running {name}…"), Style::default().fg(theme.tool)),
         ]),
         ToolStatus::Done { name, ok } => {
             let (glyph, color) = if *ok {
-                ("✓", Color::Green)
+                ("✓", theme.ok)
             } else {
-                ("✗", Color::Red)
+                ("✗", theme.err)
             };
             Line::from(vec![
                 Span::styled(format!(" {glyph} "), Style::default().fg(color).bold()),
@@ -288,29 +285,29 @@ fn render_tool_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_agent_tabs(frame: &mut Frame, app: &App, area: Rect) {
+fn render_agent_tabs(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let titles: Vec<String> = app.agents.iter().map(|a| format!(" {a} ")).collect();
     let tabs = Tabs::new(titles)
         .select(app.agent_index)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(theme.dim))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
         .divider("│");
     frame.render_widget(tabs, area);
 }
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
+fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" prompt ")
         .border_style(if app.running {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.tool)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         });
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -328,23 +325,27 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((cursor_x, inner.y));
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let mut spans: Vec<Span> = vec![Span::styled(
         app.current_agent(),
-        Style::default().fg(Color::Cyan).bold(),
+        Style::default().fg(theme.accent).bold(),
     )];
+    spans.push(Span::styled(
+        format!("  {}", theme.name),
+        Style::default().fg(theme.dim),
+    ));
     if app.running {
         spans.push(Span::raw(format!("  {} ", app.spinner())));
     }
     if let Some((input, output, cost)) = app.last_usage {
         spans.push(Span::styled(
             format!("  ↑{input} ↓{output}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         ));
         if let Some(cost) = cost {
             spans.push(Span::styled(
                 format!("  ${cost:.4}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             ));
         }
     }
@@ -355,12 +356,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     };
     spans.push(Span::styled(
         format!("    {hint}"),
-        Style::default().fg(Color::DarkGray).italic(),
+        Style::default().fg(theme.dim).italic(),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
+fn render_prompt(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     use super::app::Prompt;
 
     let (title, hint, show_input) = match &app.pending {
@@ -389,13 +390,13 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" confirm ")
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme.tool));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines = vec![Line::from(Span::styled(
         title,
-        Style::default().fg(Color::Yellow).bold(),
+        Style::default().fg(theme.tool).bold(),
     ))];
     if show_input {
         let text = format!("❯ {}", app.input);
@@ -403,7 +404,7 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(Span::styled(
         hint,
-        Style::default().fg(Color::DarkGray).italic(),
+        Style::default().fg(theme.dim).italic(),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn markdown_renders_code_fences_headings_and_inline() {
         let text = "# Title\n\nsome `code` and **bold**\n\n```\nlet x = 1;\n```\n- item";
-        let lines = markdown_lines(text);
+        let lines = markdown_lines(text, *theme_at(0));
         // headings are bold (Style carries the bold modifier, not asserted via string here);
         // assert the structural transforms: code fence content is present, bullet is bulleted.
         assert!(lines.iter().any(|l| l.to_string().contains("let x = 1;")));

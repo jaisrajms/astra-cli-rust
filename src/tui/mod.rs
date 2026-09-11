@@ -11,6 +11,7 @@
 pub mod app;
 pub mod render;
 mod stream;
+pub mod theme;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -193,6 +194,7 @@ async fn handle_terminal_event(
         KeyCode::BackTab if app.pending.is_none() => app.prev_agent(),
         KeyCode::Up if app.pending.is_none() => app.recall_older(),
         KeyCode::Down if app.pending.is_none() => app.recall_newer(),
+        KeyCode::F(2) if app.pending.is_none() => app.next_theme(),
         KeyCode::Left => app.cursor_left(),
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),
