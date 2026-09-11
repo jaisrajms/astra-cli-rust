@@ -236,6 +236,9 @@ async fn handle_terminal_event(
         KeyCode::End => app.cursor_end(),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete_forward(),
+        KeyCode::Char('/') if app.input.is_empty() && app.pending.is_none() => {
+            app.toggle_palette();
+        }
         KeyCode::Char(c) => app.push_char(c),
         _ => {}
     }
