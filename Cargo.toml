@@ -24,6 +24,7 @@ futures = "0.3"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio-stream = "0.1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 hyper = "1"

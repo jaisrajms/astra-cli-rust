@@ -1,68 +1,87 @@
 //! Rendering for the TUI: `render(frame, app)`.
 //!
-//! This is the only layer (besides the event loop) that knows about ratatui.
-//! It is deliberately a pure function of `(&mut Frame, &App)` so it can be
-//! exercised against ratatui's [`ratatui::backend::TestBackend`] without a real
-//! terminal.
+//! This is the only layer (besides the event loop) that knows about ratatui. It consumes the
+//! ratatui-free [`super::layout::Layout`] and the pre-measured rows from [`super::transcript`], so
+//! it never re-derives scroll geometry and the paint pass agrees with the scroll math.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use super::app::{App, Item, ToolOutcome, ToolStatus};
+use super::app::{App, Prompt, ToolStatus};
+use super::layout::Layout;
 use super::theme::{theme_at, Theme};
-use crate::tool::{tool_icon, tool_label};
+use super::transcript;
 
-/// Fixed layout rows (top → bottom): title, history, tool status, agent tabs,
-/// input, statusline.
-pub fn render(frame: &mut Frame, app: &App) {
+/// A ratatui `Rect` from four coordinates.
+fn rr(x: u16, y: u16, width: u16, height: u16) -> Rect {
+    Rect::new(x, y, width, height)
+}
+
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let theme = *theme_at(app.theme_index);
 
-    // A right-hand sidebar when the terminal is wide enough (the reference CLI shows it above
-    // ~120 cols; we use a slightly lower threshold and its 42-col width).
-    let (main, sidebar) = if area.width >= 110 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(60), Constraint::Length(42)])
-            .split(area);
-        (cols[0], Some(cols[1]))
-    } else {
-        (area, None)
-    };
-
     // A diff-review prompt needs room to show the proposed diff; otherwise the prompt row is short.
     let prompt_rows = match &app.pending {
-        Some(super::app::Prompt::DiffReview { .. }) => 12,
+        Some(Prompt::DiffReview { .. }) => 12,
         _ => 3,
     };
+    let layout = Layout::compute(area.width, area.height, prompt_rows);
+    app.ui.layout = Some(layout);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(prompt_rows),
-            Constraint::Length(1),
-        ])
-        .split(main);
+    let main_width = layout.transcript.width;
+    let title = rr(0, 0, main_width, 3);
+    let transcript = rr(
+        layout.transcript.x,
+        layout.transcript.y,
+        layout.transcript.width,
+        layout.transcript.height,
+    );
+    let tool_status = rr(
+        0,
+        layout.transcript.y + layout.transcript.height,
+        main_width,
+        1,
+    );
+    let agent_tabs = rr(
+        0,
+        layout.transcript.y + layout.transcript.height + 1,
+        main_width,
+        1,
+    );
+    let prompt = rr(
+        layout.prompt.x,
+        layout.prompt.y,
+        layout.prompt.width,
+        layout.prompt.height,
+    );
+    let footer = rr(
+        layout.footer.x,
+        layout.footer.y,
+        layout.footer.width,
+        layout.footer.height,
+    );
 
-    render_title(frame, app, chunks[0], theme);
-    render_history(frame, app, chunks[1], theme);
-    render_tool_status(frame, app, chunks[2], theme);
-    render_agent_tabs(frame, app, chunks[3], theme);
+    render_title(frame, app, title, theme);
+    render_history(frame, app, transcript, theme);
+    render_tool_status(frame, app, tool_status, theme);
+    render_agent_tabs(frame, app, agent_tabs, theme);
     match &app.pending {
-        Some(_) => render_prompt(frame, app, chunks[4], theme),
-        None => render_input(frame, app, chunks[4], theme),
+        Some(_) => render_prompt(frame, app, prompt, theme),
+        None => render_input(frame, app, prompt, theme),
     }
-    render_status(frame, app, chunks[5], theme);
+    render_status(frame, app, footer, theme);
 
-    if let Some(sidebar) = sidebar {
-        render_sidebar(frame, app, sidebar, theme);
+    if let Some(sidebar) = layout.sidebar {
+        render_sidebar(
+            frame,
+            app,
+            rr(sidebar.x, sidebar.y, sidebar.width, sidebar.height),
+            theme,
+        );
     }
     if app.palette.is_some() {
         render_palette(frame, app, area, theme);
@@ -89,224 +108,30 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(block, area);
 }
 
-fn render_history(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
-    let mut lines: Vec<Line> = Vec::new();
-    for item in &app.items {
-        lines.extend(item_lines(app, item, theme));
-    }
-    if !app.streaming.is_empty() {
-        lines.extend(markdown_lines(&app.streaming, theme));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No messages yet — type a prompt and press Enter.",
-            Style::default().fg(theme.dim).italic(),
-        )));
-    }
+fn render_history(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    // Measure at the inner width/height (the block border takes one column/row on each side).
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let rows = transcript::measure(app, inner_width, theme);
 
-    let content_height = area.height as usize;
-    let scroll = lines.len().saturating_sub(content_height) as u16;
+    let total = rows.len();
+    let viewport = inner_height as usize;
+    app.ui.transcript.total = total;
+    app.ui.transcript.viewport = viewport;
+    app.ui.transcript.on_content_changed(total, viewport);
 
-    let paragraph = Paragraph::new(lines)
+    let offset = app.ui.transcript.offset as usize;
+    let visible: Vec<Line> = rows
+        .iter()
+        .skip(offset)
+        .take(viewport)
+        .map(|r| r.line.clone())
+        .collect();
+
+    let paragraph = Paragraph::new(visible)
         .block(Block::default().borders(Borders::ALL).title(" session "))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-}
-
-fn item_lines(app: &App, item: &Item, theme: Theme) -> Vec<Line<'static>> {
-    match item {
-        Item::User(text) => vec![Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(theme.accent).bold()),
-            Span::raw(text.clone()),
-        ])],
-        Item::Assistant(text) => markdown_lines(text, theme),
-        Item::ToolCall {
-            name,
-            input,
-            outcome,
-            ..
-        } => tool_lines(app, name, input, outcome.as_ref(), theme),
-        Item::Notice(text) => vec![Line::from(Span::styled(
-            text.clone(),
-            Style::default().fg(theme.notice),
-        ))],
-        Item::Reasoning { text, .. } => {
-            // Collapsed: a "Thinking" header with a short preview (the reference CLI collapses
-            // reasoning; the body is only shown on expand).
-            let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();
-            let ellipsis = if text.chars().count() > 60 { "…" } else { "" };
-            vec![Line::from(vec![
-                Span::styled(" ✦ Thinking · ", Style::default().fg(theme.dim).italic()),
-                Span::styled(
-                    format!("{preview}{ellipsis}"),
-                    Style::default().fg(theme.dim),
-                ),
-            ])]
-        }
-        Item::Error(text) => vec![Line::from(Span::styled(
-            format!(" ✗ {text}"),
-            Style::default().fg(theme.err),
-        ))],
-        Item::Done(result) => vec![Line::from(Span::styled(
-            result.clone(),
-            Style::default().fg(theme.accent),
-        ))],
-    }
-}
-
-/// Render a tool call as a single inline row (icon + label), the way the reference CLI does: a
-/// spinner + active color while running, then the tool icon in muted/error color once finished.
-/// `Bash`/`ShellBash` additionally show their output beneath the command line.
-fn tool_lines(
-    app: &App,
-    name: &str,
-    input: &str,
-    outcome: Option<&ToolOutcome>,
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let label = tool_label(name, input);
-    let icon = tool_icon(name);
-    let is_shell = name == "Bash" || name == "ShellBash";
-
-    let Some(out) = outcome else {
-        // In flight: spinner glyph in the icon column.
-        return vec![Line::from(vec![
-            Span::raw("   "),
-            Span::styled(app.spinner(), Style::default().fg(theme.tool)),
-            Span::raw(" "),
-            Span::styled(label, Style::default().fg(theme.tool)),
-        ])];
-    };
-
-    let color = if out.ok { theme.dim } else { theme.err };
-    let mut lines = vec![Line::from(vec![
-        Span::raw("   "),
-        Span::styled(icon, Style::default().fg(color)),
-        Span::raw(" "),
-        Span::styled(label, Style::default().fg(color)),
-    ])];
-
-    if is_shell {
-        let shown = if out.output.is_empty() {
-            out.summary.as_str()
-        } else {
-            out.output.as_str()
-        };
-        for out_line in shown.lines().take(12) {
-            lines.push(Line::from(Span::styled(
-                format!("     {out_line}"),
-                Style::default().fg(color),
-            )));
-        }
-    } else if !out.ok && !out.summary.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("     {}", out.summary),
-            Style::default().fg(theme.err),
-        )));
-    }
-    lines
-}
-
-/// Render markdown-ish assistant text into styled lines: fenced code blocks (```), headings
-/// (#/##), bullets (- / *), inline code (`) and bold (**) get basic styling; everything else is
-/// plain. This is a lightweight approximation of the reference CLI's markdown renderer (no
-/// full syntax highlighter).
-fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut code_buf: Vec<Line<'static>> = Vec::new();
-    let mut in_code = false;
-
-    for raw in text.lines() {
-        if raw.trim_start().starts_with("```") {
-            if in_code {
-                lines.append(&mut code_buf);
-                in_code = false;
-            } else {
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code {
-            code_buf.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(theme.dim),
-            )));
-            continue;
-        }
-        if raw.trim().is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
-        let leading = raw.len() - raw.trim_start().len();
-        let body = &raw[leading..];
-        if let Some(rest) = body.strip_prefix('#') {
-            lines.push(Line::from(Span::styled(
-                rest.trim_start().to_string(),
-                Style::default().fg(theme.accent).bold(),
-            )));
-        } else if let Some(rest) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
-            let mut spans = vec![Span::styled("  • ", Style::default().fg(theme.dim))];
-            spans.extend(inline_spans(rest, theme));
-            lines.push(Line::from(spans));
-        } else {
-            lines.push(Line::from(inline_spans(body, theme)));
-        }
-    }
-    if in_code {
-        lines.append(&mut code_buf);
-    }
-    lines
-}
-
-/// Tokenize inline `**bold**` and `` `code` `` spans; other text stays plain.
-fn inline_spans(text: &str, theme: Theme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        if let Some(idx) = rest.find("**") {
-            if idx > 0 {
-                spans.push(Span::raw(rest[..idx].to_string()));
-            }
-            let after = &rest[idx + 2..];
-            match after.find("**") {
-                Some(end) => {
-                    spans.push(Span::styled(
-                        after[..end].to_string(),
-                        Style::default().bold(),
-                    ));
-                    rest = &after[end + 2..];
-                }
-                None => {
-                    spans.push(Span::raw(after.to_string()));
-                    rest = "";
-                }
-            }
-        } else if let Some(idx) = rest.find('`') {
-            if idx > 0 {
-                spans.push(Span::raw(rest[..idx].to_string()));
-            }
-            let after = &rest[idx + 1..];
-            match after.find('`') {
-                Some(end) => {
-                    spans.push(Span::styled(
-                        after[..end].to_string(),
-                        Style::default().fg(theme.ok),
-                    ));
-                    // The closing backtick is 1 byte (not 2 like `**`).
-                    rest = &after[end + 1..];
-                }
-                None => {
-                    spans.push(Span::raw(after.to_string()));
-                    rest = "";
-                }
-            }
-        } else {
-            spans.push(Span::raw(rest.to_string()));
-            rest = "";
-        }
-    }
-    spans
 }
 
 fn render_tool_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -646,7 +471,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn render_to_string(app: &App, width: u16, height: u16) -> String {
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -670,8 +495,8 @@ mod tests {
 
     #[test]
     fn renders_empty_state() {
-        let app = App::new(vec!["build".into(), "plan".into()]);
-        let out = render_to_string(&app, 60, 20);
+        let mut app = App::new(vec!["build".into(), "plan".into()]);
+        let out = render_to_string(&mut app, 60, 20);
         assert!(out.contains("Astra"));
         assert!(out.contains("build"));
         assert!(out.contains("No messages yet"));
@@ -705,7 +530,7 @@ mod tests {
                 ),
             ),
         });
-        let out = render_to_string(&app, 60, 20);
+        let out = render_to_string(&mut app, 60, 20);
         assert!(out.contains("Read src/main.rs"), "output: {out}");
         assert!(
             !out.contains("file_path"),
@@ -726,7 +551,7 @@ mod tests {
                 },
             )),
         });
-        let out = render_to_string(&app, 60, 20);
+        let out = render_to_string(&mut app, 60, 20);
         assert!(out.contains("bash"));
         assert!(out.contains("❯ hello"));
     }
@@ -744,7 +569,7 @@ mod tests {
                 },
             )),
         });
-        let out = render_to_string(&app, 60, 20);
+        let out = render_to_string(&mut app, 60, 20);
         assert!(out.contains("running read"));
         assert!(out.contains("⠋"));
     }
@@ -752,7 +577,7 @@ mod tests {
     #[test]
     fn markdown_renders_code_fences_headings_and_inline() {
         let text = "# Title\n\nsome `code` and **bold**\n\n```\nlet x = 1;\n```\n- item";
-        let lines = markdown_lines(text, *theme_at(0));
+        let lines = transcript::markdown_lines(text, *theme_at(0));
         // headings are bold (Style carries the bold modifier, not asserted via string here);
         // assert the structural transforms: code fence content is present, bullet is bulleted.
         assert!(lines.iter().any(|l| l.to_string().contains("let x = 1;")));
@@ -781,8 +606,8 @@ mod tests {
             "**unclosed",
             "`é`",
         ] {
-            let _ = inline_spans(text, theme);
-            let _ = markdown_lines(text, theme);
+            let _ = transcript::inline_spans(text, theme);
+            let _ = transcript::markdown_lines(text, theme);
         }
     }
 }

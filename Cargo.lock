@@ -101,6 +101,7 @@ dependencies = [
  "tonic",
  "tower 0.4.13",
  "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

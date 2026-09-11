@@ -70,19 +70,24 @@ pub enum SidebarMode {
     Overlay,
 }
 
-/// Vertical scroll position + auto-follow flag for one scroll domain (transcript, sidebar).
+/// Vertical scroll position + auto-follow flag for one scroll domain (transcript, sidebar). `total`
+/// and `viewport` are the last measured content/viewport heights (set by the render pass; read by the
+/// event layer when scrolling), so the event path never needs the ratatui geometry itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScrollState {
     pub offset: u16,
     pub follow_bottom: bool,
+    pub total: usize,
+    pub viewport: usize,
 }
 
-#[allow(dead_code)] // Scroll methods are wired into transcript scrolling in Phase 3.
 impl ScrollState {
     pub fn at_bottom() -> Self {
         Self {
             offset: 0,
             follow_bottom: true,
+            total: 0,
+            viewport: 0,
         }
     }
 
@@ -127,7 +132,6 @@ impl ScrollState {
 }
 
 /// The largest legal scroll offset for a `total`-row body in a `viewport`-row window.
-#[allow(dead_code)] // used only via the ScrollState methods (wired in Phase 3).
 fn max_offset(total: usize, viewport: usize) -> u16 {
     total.saturating_sub(viewport).min(u16::MAX as usize) as u16
 }
@@ -152,6 +156,8 @@ pub struct UiState {
     pub mcp: Vec<(String, String)>,
     /// Whether an LSP provider is attached.
     pub lsp_enabled: bool,
+    /// The last computed layout (ratatui-free rects), for mouse hit-testing in the event layer.
+    pub layout: Option<super::layout::Layout>,
 }
 
 impl Default for UiState {
@@ -167,6 +173,7 @@ impl Default for UiState {
             context_limit: None,
             mcp: Vec::new(),
             lsp_enabled: false,
+            layout: None,
         }
     }
 }
@@ -354,6 +361,31 @@ impl App {
             .get(self.agent_index)
             .map(String::as_str)
             .unwrap_or("build")
+    }
+
+    /// Reconcile [`UiState::focus`] with the active popup (palette > mention > pending). When a
+    /// popup is open, focus is the matching [`Focus::Popup`]; when it closes, focus returns to the
+    /// prompt. Manual Transcript/Sidebar focus is left untouched while no popup is open.
+    pub fn sync_focus(&mut self) {
+        let popup = if self.palette.is_some() {
+            Some(PopupKind::Palette)
+        } else if self.mention.is_some() {
+            Some(PopupKind::Mention)
+        } else {
+            self.pending.as_ref().map(|p| match p {
+                Prompt::Permission { .. } => PopupKind::Permission,
+                Prompt::Question { .. } => PopupKind::Question,
+                Prompt::DiffReview { .. } => PopupKind::DiffReview,
+            })
+        };
+        match popup {
+            Some(kind) => self.ui.focus = Focus::Popup(kind),
+            None => {
+                if matches!(self.ui.focus, Focus::Popup(_)) {
+                    self.ui.focus = Focus::Prompt;
+                }
+            }
+        }
     }
 
     /// The spinner glyph for the current tick.
@@ -1409,6 +1441,8 @@ mod tests {
         let mut s = ScrollState {
             offset: u16::MAX,
             follow_bottom: false,
+            total: 0,
+            viewport: 0,
         };
         s.clamp(10, 5);
         assert_eq!(s.offset, 5);

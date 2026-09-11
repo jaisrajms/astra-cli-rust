@@ -10,9 +10,12 @@
 
 pub mod app;
 pub mod event;
+pub mod layout;
 pub mod render;
 mod stream;
 pub mod theme;
+pub mod transcript;
+pub mod wrap;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,7 +117,8 @@ async fn run_inner(
                                 *session_id.lock().unwrap() = Some(sid.value.clone());
                             }
                         }
-                        app.apply_chat_event(&event)
+                        app.apply_chat_event(&event);
+                        app.sync_focus();
                     }
                     // The daemon closed the stream cleanly.
                     Some(DaemonEvent::Closed) | None => break,
@@ -132,7 +136,7 @@ async fn run_inner(
             }
         }
 
-        terminal.draw(|frame| render::render(frame, &app))?;
+        terminal.draw(|frame| render::render(frame, &mut app))?;
 
         if app.quit {
             break;
@@ -155,15 +159,24 @@ async fn apply_command(
     match command {
         UiCommand::Noop => {}
         UiCommand::ScrollTranscript(delta) => {
-            // TODO(Phase 3): scroll against the measured transcript height; here the placeholder
-            // total is zero, so the offset stays pinned at the top until measurement lands.
-            app.ui.transcript.scroll_by(delta, 0, 0);
+            let total = app.ui.transcript.total;
+            let viewport = app.ui.transcript.viewport;
+            app.ui.transcript.scroll_by(delta, total, viewport);
         }
         UiCommand::ScrollSidebar(delta) => {
             // TODO(Phase 5): scroll against the measured sidebar height.
-            let next = app.ui.sidebar_offset as i32 + delta as i32;
+            let next = app.ui.sidebar_offset as i32 + delta;
             app.ui.sidebar_offset = next.clamp(0, u16::MAX as i32) as u16;
         }
+        UiCommand::TranscriptStart => {
+            let (total, viewport) = (app.ui.transcript.total, app.ui.transcript.viewport);
+            app.ui.transcript.scroll_to_start(total, viewport);
+        }
+        UiCommand::TranscriptEnd => {
+            let (total, viewport) = (app.ui.transcript.total, app.ui.transcript.viewport);
+            app.ui.transcript.scroll_to_end(total, viewport);
+        }
+        UiCommand::Focus(focus) => app.ui.focus = focus,
         UiCommand::Insert(c) => app.push_char(c),
         UiCommand::Backspace => app.backspace(),
         UiCommand::DeleteForward => app.delete_forward(),
@@ -286,6 +299,9 @@ async fn apply_command(
             app.ui.sidebar_offset = 0;
         }
     }
+
+    // Keep focus in sync with any popup that just opened/closed.
+    app.sync_focus();
 
     Ok(())
 }

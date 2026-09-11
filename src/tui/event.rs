@@ -9,10 +9,11 @@
 //! permission/question/diff-review, then the prompt, then global keys.
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
 use super::app::{App, Focus, Prompt};
+use super::layout::Surface;
 
 /// A local UI command produced by routing one terminal event. `mod.rs` applies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,11 @@ pub enum UiCommand {
     ScrollTranscript(i32),
     /// Scroll the sidebar by `delta` rows.
     ScrollSidebar(i32),
+    /// Jump to the top/bottom of the transcript.
+    TranscriptStart,
+    TranscriptEnd,
+    /// Move focus to the given surface.
+    Focus(Focus),
     // Prompt editing.
     Insert(char),
     Backspace,
@@ -98,6 +104,16 @@ fn route_key(key: &KeyEvent, app: &App) -> UiCommand {
         KeyCode::Down if app.mention.is_some() => UiCommand::MentionDown,
         KeyCode::Backspace if app.mention.is_some() => UiCommand::MentionBackspace,
         KeyCode::Char(c) if app.mention.is_some() => UiCommand::MentionChar(c),
+        // Transcript focus: scroll keys route to the transcript; Esc returns focus to the prompt.
+        KeyCode::Up if app.ui.focus == Focus::Transcript => UiCommand::ScrollTranscript(-1),
+        KeyCode::Down if app.ui.focus == Focus::Transcript => UiCommand::ScrollTranscript(1),
+        KeyCode::PageUp => UiCommand::ScrollTranscript(-page_size(app)),
+        KeyCode::PageDown => UiCommand::ScrollTranscript(page_size(app)),
+        KeyCode::Home if app.ui.focus == Focus::Transcript => UiCommand::TranscriptStart,
+        KeyCode::End if app.ui.focus == Focus::Transcript => UiCommand::TranscriptEnd,
+        KeyCode::Esc if matches!(app.ui.focus, Focus::Transcript | Focus::Sidebar) => {
+            UiCommand::Focus(Focus::Prompt)
+        }
         // A pending interaction consumes Enter/Esc before the composer can see them.
         KeyCode::Esc => match &app.pending {
             Some(Prompt::Permission { .. }) => UiCommand::ResolvePermission(false),
@@ -151,17 +167,38 @@ fn route_key(key: &KeyEvent, app: &App) -> UiCommand {
 }
 
 fn route_mouse(mouse: &MouseEvent, app: &App) -> UiCommand {
-    // Wheel scrolls the focused scroll domain; transcript is the default (mouse-position hit-testing
-    // against layout rectangles lands with the layout layer in Phase 3).
-    let scroll = |delta: i32| match app.ui.focus {
-        Focus::Sidebar => UiCommand::ScrollSidebar(delta),
-        _ => UiCommand::ScrollTranscript(delta),
-    };
+    let surface = app
+        .ui
+        .layout
+        .map(|l| l.hit_test(mouse.column, mouse.row))
+        .unwrap_or(Surface::None);
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll(-3),
-        MouseEventKind::ScrollDown => scroll(3),
+        // Wheel scrolls the surface under the cursor (over a popup/prompt it is consumed, not
+        // routed to the transcript).
+        MouseEventKind::ScrollUp => match surface {
+            Surface::Sidebar => UiCommand::ScrollSidebar(-3),
+            Surface::Transcript => UiCommand::ScrollTranscript(-3),
+            _ => UiCommand::Noop,
+        },
+        MouseEventKind::ScrollDown => match surface {
+            Surface::Sidebar => UiCommand::ScrollSidebar(3),
+            Surface::Transcript => UiCommand::ScrollTranscript(3),
+            _ => UiCommand::Noop,
+        },
+        // Left click moves focus to the surface under the cursor.
+        MouseEventKind::Down(MouseButton::Left) => match surface {
+            Surface::Transcript => UiCommand::Focus(Focus::Transcript),
+            Surface::Sidebar => UiCommand::Focus(Focus::Sidebar),
+            Surface::Prompt => UiCommand::Focus(Focus::Prompt),
+            Surface::None => UiCommand::Noop,
+        },
         _ => UiCommand::Noop,
     }
+}
+
+/// One page of transcript scroll: the measured viewport height (at least one row).
+fn page_size(app: &App) -> i32 {
+    (app.ui.transcript.viewport.max(1)) as i32
 }
 
 #[cfg(test)]
@@ -328,26 +365,103 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_scrolls_the_focused_domain() {
+    fn mouse_wheel_routes_by_cursor_position() {
+        use crate::tui::layout::Layout;
+
         let mut app = App::new(vec![]);
-        let up = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        };
-        let down = MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
+        app.ui.layout = Some(Layout::compute(120, 40, 3));
+
+        let at = |column: u16, row: u16, kind| MouseEvent {
+            kind,
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
         };
 
-        assert_eq!(route_mouse(&up, &app), UiCommand::ScrollTranscript(-3));
-        assert_eq!(route_mouse(&down, &app), UiCommand::ScrollTranscript(3));
+        // Over the transcript (x=10, y=10).
+        assert_eq!(
+            route_mouse(&at(10, 10, MouseEventKind::ScrollUp), &app),
+            UiCommand::ScrollTranscript(-3)
+        );
+        assert_eq!(
+            route_mouse(&at(10, 10, MouseEventKind::ScrollDown), &app),
+            UiCommand::ScrollTranscript(3)
+        );
+        // Over the sidebar (x=100, y=10) the wheel scrolls the sidebar instead.
+        assert_eq!(
+            route_mouse(&at(100, 10, MouseEventKind::ScrollUp), &app),
+            UiCommand::ScrollSidebar(-3)
+        );
+        assert_eq!(
+            route_mouse(&at(100, 10, MouseEventKind::ScrollDown), &app),
+            UiCommand::ScrollSidebar(3)
+        );
+        // Over the prompt (x=10, y=37) the wheel is consumed, not routed.
+        assert_eq!(
+            route_mouse(&at(10, 37, MouseEventKind::ScrollUp), &app),
+            UiCommand::Noop
+        );
 
-        app.ui.focus = Focus::Sidebar;
-        assert_eq!(route_mouse(&up, &app), UiCommand::ScrollSidebar(-3));
+        // Left click focuses the surface under the cursor.
+        assert_eq!(
+            route_mouse(&at(10, 10, MouseEventKind::Down(MouseButton::Left)), &app),
+            UiCommand::Focus(Focus::Transcript)
+        );
+        assert_eq!(
+            route_mouse(&at(100, 10, MouseEventKind::Down(MouseButton::Left)), &app),
+            UiCommand::Focus(Focus::Sidebar)
+        );
+        assert_eq!(
+            route_mouse(&at(10, 37, MouseEventKind::Down(MouseButton::Left)), &app),
+            UiCommand::Focus(Focus::Prompt)
+        );
+    }
+
+    #[test]
+    fn transcript_focus_scroll_keys_route_to_scroll() {
+        use crate::tui::layout::Layout;
+
+        let mut app = App::new(vec![]);
+        app.ui.layout = Some(Layout::compute(120, 40, 3));
+        app.ui.transcript.viewport = 20;
+        app.ui.focus = Focus::Transcript;
+
+        assert_eq!(
+            route_key(&key(KeyCode::Up, KeyModifiers::NONE), &app),
+            UiCommand::ScrollTranscript(-1)
+        );
+        assert_eq!(
+            route_key(&key(KeyCode::Down, KeyModifiers::NONE), &app),
+            UiCommand::ScrollTranscript(1)
+        );
+        assert_eq!(
+            route_key(&key(KeyCode::PageDown, KeyModifiers::NONE), &app),
+            UiCommand::ScrollTranscript(20)
+        );
+        assert_eq!(
+            route_key(&key(KeyCode::Home, KeyModifiers::NONE), &app),
+            UiCommand::TranscriptStart
+        );
+        assert_eq!(
+            route_key(&key(KeyCode::End, KeyModifiers::NONE), &app),
+            UiCommand::TranscriptEnd
+        );
+        // Esc returns focus to the prompt (instead of quitting).
+        assert_eq!(
+            route_key(&key(KeyCode::Esc, KeyModifiers::NONE), &app),
+            UiCommand::Focus(Focus::Prompt)
+        );
+
+        // In prompt focus the same keys retain their prompt meaning.
+        app.ui.focus = Focus::Prompt;
+        assert_eq!(
+            route_key(&key(KeyCode::Up, KeyModifiers::NONE), &app),
+            UiCommand::RecallOlder
+        );
+        assert_eq!(
+            route_key(&key(KeyCode::Home, KeyModifiers::NONE), &app),
+            UiCommand::CursorHome
+        );
     }
 
     #[test]
