@@ -372,7 +372,7 @@ impl App {
             pending: None,
             last_usage: None,
             todos: Vec::new(),
-            theme_index: 0,
+            theme_index: super::theme::default_theme_index(),
             palette: None,
             mention: None,
             files: Vec::new(),

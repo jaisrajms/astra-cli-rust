@@ -50,9 +50,103 @@ pub const THEMES: &[Theme] = &[
         notice: Color::Gray,
         dim: Color::DarkGray,
     },
+    // Light-background variants. Avoid Yellow/White/Light* accents, which lose contrast on white;
+    // the "normal" ANSI hues (Blue/Magenta/Green/Red/Cyan) map to dark-enough shades on light
+    // terminals to stay readable.
+    Theme {
+        name: "default-light",
+        accent: Color::Blue,
+        tool: Color::Magenta,
+        ok: Color::Green,
+        err: Color::Red,
+        notice: Color::Cyan,
+        dim: Color::DarkGray,
+    },
+    Theme {
+        name: "dracula-light",
+        accent: Color::Magenta,
+        tool: Color::Blue,
+        ok: Color::Green,
+        err: Color::Red,
+        notice: Color::Cyan,
+        dim: Color::DarkGray,
+    },
+    Theme {
+        name: "mono-light",
+        accent: Color::Black,
+        tool: Color::Black,
+        ok: Color::Green,
+        err: Color::Red,
+        notice: Color::DarkGray,
+        dim: Color::DarkGray,
+    },
 ];
+
+/// The index of the first light theme.
+const LIGHT_THEMES_START: usize = 3;
 
 /// The theme for the given index (wrapped into range).
 pub fn theme_at(index: usize) -> &'static Theme {
     &THEMES[index % THEMES.len()]
+}
+
+/// The starting theme index for the current terminal: the first light theme when the terminal
+/// reports a light background, else the default dark theme.
+///
+/// Detection is best-effort and conservative (defaults to dark — the common dev-terminal case):
+///   - `$TERM_BACKGROUND` == "light" wins;
+///   - else `$COLORFGBG` (the `fg;bg` convention) where the background is a light ANSI color
+///     (7 = white, 15 = bright white).
+pub fn default_theme_index() -> usize {
+    if is_light_terminal() {
+        LIGHT_THEMES_START
+    } else {
+        0
+    }
+}
+
+fn is_light_terminal() -> bool {
+    let term_background = std::env::var("TERM_BACKGROUND").ok();
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    is_light(term_background.as_deref(), colorfgbg.as_deref())
+}
+
+/// Pure form of [`is_light_terminal`] (testable without touching the process env).
+fn is_light(term_background: Option<&str>, colorfgbg: Option<&str>) -> bool {
+    if let Some(bg) = term_background {
+        // An explicit `TERM_BACKGROUND` wins (only "light" selects the light themes).
+        return bg.eq_ignore_ascii_case("light");
+    }
+    if let Some(value) = colorfgbg {
+        let bg = value.split(';').nth(1).unwrap_or("");
+        return matches!(bg.trim(), "15" | "7");
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_at_wraps_and_light_themes_exist() {
+        assert_eq!(theme_at(0).name, "default");
+        assert_eq!(theme_at(3).name, "default-light");
+        assert_eq!(theme_at(THEMES.len()).name, "default");
+    }
+
+    #[test]
+    fn light_detection_prefers_explicit_term_background() {
+        assert!(is_light(Some("light"), None));
+        assert!(!is_light(Some("dark"), Some("0;15")));
+        assert!(!is_light(None, None));
+    }
+
+    #[test]
+    fn light_detection_reads_colorfgbg_background() {
+        assert!(is_light(None, Some("0;15")));
+        assert!(is_light(None, Some("0;7")));
+        assert!(!is_light(None, Some("15;0")));
+        assert!(!is_light(None, Some("garbage")));
+    }
 }
