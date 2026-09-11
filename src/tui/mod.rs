@@ -130,6 +130,27 @@ async fn handle_terminal_event(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_quit();
         }
+        // Command palette (leader key Ctrl-X).
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_palette();
+        }
+        KeyCode::Esc if app.palette.is_some() => app.palette = None,
+        KeyCode::Enter if app.palette.is_some() => {
+            let label = app.palette_selected();
+            app.palette = None;
+            match label {
+                Some("quit") => app.request_quit(),
+                Some("theme") => app.next_theme(),
+                Some("agent") => app.next_agent(),
+                Some("clear input") => {
+                    app.input.clear();
+                    app.cursor = 0;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Up if app.palette.is_some() => app.palette_up(),
+        KeyCode::Down if app.palette.is_some() => app.palette_down(),
         KeyCode::Esc => {
             let sid = session_id.lock().unwrap().clone();
             match app.pending.clone() {

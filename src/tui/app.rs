@@ -25,6 +25,9 @@ pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", 
 /// Agents shown when the daemon cannot be reached (or returns none).
 pub const DEFAULT_AGENTS: &[&str] = &["build", "plan", "explore", "general"];
 
+/// Client-side command-palette entries (the leader key opens it).
+pub const PALETTE_COMMANDS: &[&str] = &["quit", "theme", "agent", "clear input"];
+
 /// Whether a tool is currently running, and how the most recent one finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -98,6 +101,8 @@ pub struct App {
     pub last_usage: Option<(i64, i64, Option<f64>)>,
     /// Index into the built-in theme list.
     pub theme_index: usize,
+    /// Open command-palette selection (None = closed).
+    pub palette: Option<usize>,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
@@ -128,6 +133,7 @@ impl App {
             pending: None,
             last_usage: None,
             theme_index: 0,
+            palette: None,
             quit: false,
             tick: 0,
         }
@@ -277,6 +283,33 @@ impl App {
     /// Cycle to the next built-in theme.
     pub fn next_theme(&mut self) {
         self.theme_index = (self.theme_index + 1) % super::theme::THEMES.len();
+    }
+
+    // --- command palette ---
+
+    pub fn toggle_palette(&mut self) {
+        self.palette = if self.palette.is_some() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    pub fn palette_up(&mut self) {
+        if let Some(i) = self.palette {
+            self.palette = Some((i + PALETTE_COMMANDS.len() - 1) % PALETTE_COMMANDS.len());
+        }
+    }
+
+    pub fn palette_down(&mut self) {
+        if let Some(i) = self.palette {
+            self.palette = Some((i + 1) % PALETTE_COMMANDS.len());
+        }
+    }
+
+    /// The selected palette command label, or `None` when the palette is closed.
+    pub fn palette_selected(&self) -> Option<&'static str> {
+        self.palette.map(|i| PALETTE_COMMANDS[i])
     }
 
     /// Resolve the pending permission prompt: `allow` true → allow, false → deny. Returns the

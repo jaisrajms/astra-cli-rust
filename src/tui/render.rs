@@ -58,6 +58,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(sidebar) = sidebar {
         render_sidebar(frame, app, sidebar, theme);
     }
+    if app.palette.is_some() {
+        render_palette(frame, app, area, theme);
+    }
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -477,6 +480,42 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .block(Block::default().borders(Borders::LEFT).title(" session "))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn render_palette(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    use super::app::PALETTE_COMMANDS;
+
+    let width = 26_u16;
+    let height = PALETTE_COMMANDS.len() as u16 + 2;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let palette_area = Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+
+    let items: Vec<Line> = PALETTE_COMMANDS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if Some(i) == app.palette {
+                Line::from(Span::styled(
+                    format!("▌ {c}"),
+                    Style::default().fg(theme.accent).bold(),
+                ))
+            } else {
+                Line::from(Span::raw(format!("  {c}")))
+            }
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" commands ")
+        .border_style(Style::default().fg(theme.accent));
+    frame.render_widget(Paragraph::new(items).block(block), palette_area);
 }
 
 #[cfg(test)]
