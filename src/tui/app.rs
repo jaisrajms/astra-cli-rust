@@ -40,11 +40,13 @@ pub enum Item {
     Assistant(String),
     ToolCall {
         name: String,
+        input: String,
     },
     ToolResult {
         name: String,
         summary: String,
         ok: bool,
+        output: String,
     },
     Usage {
         input: i64,
@@ -327,6 +329,7 @@ impl App {
                 self.flush_streaming();
                 self.items.push(Item::ToolCall {
                     name: t.name.clone(),
+                    input: t.input.clone(),
                 });
                 self.tool = ToolStatus::Running {
                     id: t.id.clone(),
@@ -338,6 +341,7 @@ impl App {
                     name: t.name.clone(),
                     summary: t.summary.clone(),
                     ok: !t.is_error,
+                    output: t.output.clone(),
                 });
                 self.tool = ToolStatus::Done {
                     name: t.name.clone(),
@@ -449,7 +453,7 @@ mod tests {
         // streaming text is flushed to history at the tool boundary
         assert_eq!(app.streaming, "");
         assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
-        assert!(matches!(app.items[2], Item::ToolCall { ref name } if name == "bash"));
+        assert!(matches!(app.items[2], Item::ToolCall { ref name, .. } if name == "bash"));
         assert_eq!(
             app.tool,
             ToolStatus::Running {
@@ -485,7 +489,7 @@ mod tests {
         assert_eq!(app.items.len(), 5);
         assert!(matches!(app.items[0], Item::User(ref s) if s == "do the thing"));
         assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
-        assert!(matches!(app.items[2], Item::ToolCall { ref name } if name == "bash"));
+        assert!(matches!(app.items[2], Item::ToolCall { ref name, .. } if name == "bash"));
         assert!(
             matches!(app.items[3], Item::ToolResult { ref name, ok: true, .. } if name == "bash")
         );

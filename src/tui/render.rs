@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 use super::app::{App, Item, ToolStatus};
+use crate::tool::{summarize_input, tool_icon};
 
 /// Fixed layout rows (top → bottom): title, history, tool status, agent tabs,
 /// input, help.
@@ -89,20 +90,42 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
             Span::raw(text.clone()),
         ])],
         Item::Assistant(text) => vec![Line::from(Span::raw(text.clone()))],
-        Item::ToolCall { name } => vec![Line::from(vec![
-            Span::styled(" ⚙ ", Style::default().fg(Color::Yellow)),
-            Span::styled(name.clone(), Style::default().fg(Color::Yellow).italic()),
-        ])],
-        Item::ToolResult { name, summary, ok } => {
+        Item::ToolCall { name, input } => {
+            let args = summarize_input(input);
+            vec![Line::from(vec![
+                Span::styled(
+                    format!(" {} ", tool_icon(name)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{name}{args}"),
+                    Style::default().fg(Color::Yellow).italic(),
+                ),
+            ])]
+        }
+        Item::ToolResult {
+            name,
+            summary,
+            ok,
+            output,
+        } => {
             let mark = if *ok { "✓" } else { "✗" };
             let color = if *ok { Color::Green } else { Color::Red };
-            vec![Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::styled(format!("   {mark} {name}"), Style::default().fg(color)),
                 Span::styled(
                     format!(" — {summary}"),
                     Style::default().fg(Color::DarkGray),
                 ),
-            ])]
+            ])];
+            let shown = if output.is_empty() { summary.as_str() } else { output.as_str() };
+            for out_line in shown.lines().take(6) {
+                lines.push(Line::from(Span::styled(
+                    format!("     {out_line}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines
         }
         Item::Usage {
             input,
