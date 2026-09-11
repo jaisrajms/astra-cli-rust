@@ -48,11 +48,6 @@ pub enum Item {
         ok: bool,
         output: String,
     },
-    Usage {
-        input: i64,
-        output: i64,
-        cost: Option<f64>,
-    },
     Notice(String),
     Reasoning(String),
     Error(String),
@@ -95,6 +90,8 @@ pub struct App {
     pub title: Option<String>,
     /// The active interactive prompt (permission / ask-user), if any.
     pub pending: Option<Prompt>,
+    /// The most recent usage sample (input, output, cost) for the footer statusline.
+    pub last_usage: Option<(i64, i64, Option<f64>)>,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
@@ -121,6 +118,7 @@ impl App {
             error: None,
             title: None,
             pending: None,
+            last_usage: None,
             quit: false,
             tick: 0,
         }
@@ -348,11 +346,11 @@ impl App {
                     ok: !t.is_error,
                 };
             }
-            Some(agent_event::Kind::Usage(u)) => self.items.push(Item::Usage {
-                input: u.input_tokens,
-                output: u.output_tokens,
-                cost: u.cost_usd,
-            }),
+            Some(agent_event::Kind::Usage(u)) => {
+                // Usage is surfaced in the footer statusline, not the message scrollback
+                // (opencode parity); the last sample is kept for rendering.
+                self.last_usage = Some((u.input_tokens, u.output_tokens, u.cost_usd));
+            }
             Some(agent_event::Kind::Notice(n)) => self.items.push(Item::Notice(n.text.clone())),
             Some(agent_event::Kind::Reasoning(r)) => {
                 self.items.push(Item::Reasoning(r.text.clone()))
@@ -472,28 +470,24 @@ mod tests {
         );
 
         app.apply_agent_event(&usage());
-        assert!(matches!(
-            app.items.last(),
-            Some(Item::Usage {
-                input: 12,
-                output: 7,
-                ..
-            })
-        ));
+        assert_eq!(
+            app.last_usage,
+            Some((12, 7, Some(0.0042))),
+            "usage is tracked in the footer, not the scrollback"
+        );
 
         assert!(app.running);
         app.apply_agent_event(&done());
         assert!(!app.running);
 
-        // full history order: user, assistant(text), tool-call, tool-result, usage
-        assert_eq!(app.items.len(), 5);
+        // full history order: user, assistant(text), tool-call, tool-result
+        assert_eq!(app.items.len(), 4);
         assert!(matches!(app.items[0], Item::User(ref s) if s == "do the thing"));
         assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
         assert!(matches!(app.items[2], Item::ToolCall { ref name, .. } if name == "bash"));
         assert!(
             matches!(app.items[3], Item::ToolResult { ref name, ok: true, .. } if name == "bash")
         );
-        assert!(matches!(app.items[4], Item::Usage { .. }));
     }
 
     #[test]

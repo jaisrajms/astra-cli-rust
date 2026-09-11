@@ -5,7 +5,7 @@
 //! exercised against ratatui's [`ratatui::backend::TestBackend`] without a real
 //! terminal.
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
@@ -15,9 +15,7 @@ use super::app::{App, Item, ToolStatus};
 use crate::tool::{summarize_input, tool_icon};
 
 /// Fixed layout rows (top → bottom): title, history, tool status, agent tabs,
-/// input, help.
-const HELP: &str = "[Tab/Shift-Tab] agent   [Enter] send   [Ctrl-C / q] quit";
-
+/// input, statusline.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
@@ -41,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Some(_) => render_prompt(frame, app, chunks[4]),
         None => render_input(frame, app, chunks[4]),
     }
-    render_help(frame, chunks[5]);
+    render_status(frame, app, chunks[5]);
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect) {
@@ -126,19 +124,6 @@ fn item_lines(item: &Item) -> Vec<Line<'static>> {
                 )));
             }
             lines
-        }
-        Item::Usage {
-            input,
-            output,
-            cost,
-        } => {
-            let cost = cost
-                .map(|c| format!("${c:.4}"))
-                .unwrap_or_else(|| "?".to_string());
-            vec![Line::from(Span::styled(
-                format!("   ↑{input} ↓{output} tokens · {cost}"),
-                Style::default().fg(Color::DarkGray),
-            ))]
         }
         Item::Notice(text) => vec![Line::from(Span::styled(
             text.clone(),
@@ -227,10 +212,36 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((cursor_x, inner.y));
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let line = Line::from(Span::styled(HELP, Style::default().fg(Color::DarkGray)));
-    let paragraph = Paragraph::new(line).alignment(Alignment::Center);
-    frame.render_widget(paragraph, area);
+fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = vec![Span::styled(
+        app.current_agent(),
+        Style::default().fg(Color::Cyan).bold(),
+    )];
+    if app.running {
+        spans.push(Span::raw(format!("  {} ", app.spinner())));
+    }
+    if let Some((input, output, cost)) = app.last_usage {
+        spans.push(Span::styled(
+            format!("  ↑{input} ↓{output}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        if let Some(cost) = cost {
+            spans.push(Span::styled(
+                format!("  ${cost:.4}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    let hint = if app.running {
+        "esc interrupt"
+    } else {
+        "ctrl+c / q exit"
+    };
+    spans.push(Span::styled(
+        format!("    {hint}"),
+        Style::default().fg(Color::DarkGray).italic(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
