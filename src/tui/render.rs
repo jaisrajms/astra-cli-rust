@@ -125,12 +125,13 @@ fn item_lines(app: &App, item: &Item, theme: Theme) -> Vec<Line<'static>> {
             name,
             input,
             outcome,
+            ..
         } => tool_lines(app, name, input, outcome.as_ref(), theme),
         Item::Notice(text) => vec![Line::from(Span::styled(
             text.clone(),
             Style::default().fg(theme.notice),
         ))],
-        Item::Reasoning(text) => {
+        Item::Reasoning { text, .. } => {
             // Collapsed: a "Thinking" header with a short preview (the reference CLI collapses
             // reasoning; the body is only shown on expand).
             let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();

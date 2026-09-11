@@ -14,6 +14,8 @@
 //! a history item at the next tool/control boundary, so a long stream never
 //! triggers a redraw-from-scratch.
 
+use std::collections::HashSet;
+
 use astra_proto::astra::engine::v1::{
     agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent, ResolveAskUser,
     ResolveDiffReview, ResolveToolPermission, SessionId,
@@ -36,6 +38,147 @@ pub enum ToolStatus {
     Done { name: String, ok: bool },
 }
 
+/// Which surface owns keyboard focus. Routing precedence is applied by the event layer (Phase 2);
+/// this is only the *state* of focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Focus variants are wired to routing in Phase 2.
+pub enum Focus {
+    Prompt,
+    Transcript,
+    Sidebar,
+    Popup(PopupKind),
+}
+
+/// The popup kinds the focus model tracks (each maps to an existing `pending`/`palette`/`mention`
+/// surface; the consolidation of those flags onto this enum lands with the event layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // PopupKind variants are consolidated with pending/palette/mention in Phase 2.
+pub enum PopupKind {
+    Palette,
+    Mention,
+    Permission,
+    Question,
+    DiffReview,
+}
+
+/// How the sidebar is presented on a narrow terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Docked/Overlay are applied by the layout layer in Phase 5.
+pub enum SidebarMode {
+    Hidden,
+    Docked,
+    Overlay,
+}
+
+/// Vertical scroll position + auto-follow flag for one scroll domain (transcript, sidebar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollState {
+    pub offset: u16,
+    pub follow_bottom: bool,
+}
+
+#[allow(dead_code)] // Scroll methods are wired into transcript scrolling in Phase 3.
+impl ScrollState {
+    pub fn at_bottom() -> Self {
+        Self {
+            offset: 0,
+            follow_bottom: true,
+        }
+    }
+
+    /// Clamp `offset` into `[0, max(total, viewport)]`.
+    pub fn clamp(&mut self, total: usize, viewport: usize) {
+        self.offset = self.offset.min(max_offset(total, viewport));
+    }
+
+    /// Scroll by `delta` rows. A negative delta (scrolling up) disables auto-follow; landing back at
+    /// the bottom re-enables it.
+    pub fn scroll_by(&mut self, delta: i32, total: usize, viewport: usize) {
+        if delta < 0 {
+            self.follow_bottom = false;
+        }
+        let max = max_offset(total, viewport) as i32;
+        let next = (self.offset as i32 + delta).clamp(0, max);
+        self.offset = next as u16;
+        if next >= max {
+            self.follow_bottom = true;
+        }
+    }
+
+    /// Jump to the top; auto-follow stays off unless the content fits in the viewport.
+    pub fn scroll_to_start(&mut self, total: usize, viewport: usize) {
+        self.offset = 0;
+        self.follow_bottom = total <= viewport;
+    }
+
+    /// Jump to the bottom and resume auto-follow.
+    pub fn scroll_to_end(&mut self, total: usize, viewport: usize) {
+        self.offset = max_offset(total, viewport);
+        self.follow_bottom = true;
+    }
+
+    /// Called after content changes: clamp, then move to the new bottom only while following.
+    pub fn on_content_changed(&mut self, total: usize, viewport: usize) {
+        self.clamp(total, viewport);
+        if self.follow_bottom {
+            self.offset = max_offset(total, viewport);
+        }
+    }
+}
+
+/// The largest legal scroll offset for a `total`-row body in a `viewport`-row window.
+#[allow(dead_code)] // used only via the ScrollState methods (wired in Phase 3).
+fn max_offset(total: usize, viewport: usize) -> u16 {
+    total.saturating_sub(viewport).min(u16::MAX as usize) as u16
+}
+
+/// Presentation-only state, kept separate from daemon truth (`items`, `streaming`, `tool`). This is
+/// the ratatui-native equivalent of the reference CLI's sticky scrollbox + component-local collapse
+/// signals: ratatui owns no widget state, so we hold it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiState {
+    pub focus: Focus,
+    pub transcript: ScrollState,
+    pub sidebar_offset: u16,
+    pub sidebar: SidebarMode,
+    /// Tool items expanded past their bounded preview, keyed by stable tool id.
+    pub expanded_tools: HashSet<String>,
+    /// Reasoning blocks expanded, keyed by stable reasoning id.
+    pub expanded_reasoning: HashSet<String>,
+    /// The resolved model id + context window from the latest `UsageEvent` (status/context meters).
+    pub model: Option<String>,
+    pub context_limit: Option<u64>,
+    /// MCP server connection status from `ConnectionStatusEvent` (name, status).
+    pub mcp: Vec<(String, String)>,
+    /// Whether an LSP provider is attached.
+    pub lsp_enabled: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            focus: Focus::Prompt,
+            transcript: ScrollState::at_bottom(),
+            sidebar_offset: 0,
+            sidebar: SidebarMode::Hidden,
+            expanded_tools: HashSet::new(),
+            expanded_reasoning: HashSet::new(),
+            model: None,
+            context_limit: None,
+            mcp: Vec::new(),
+            lsp_enabled: false,
+        }
+    }
+}
+
+impl UiState {
+    /// Clamp the sidebar offset into `[0, max(total, viewport)]`.
+    #[allow(dead_code)] // wired into sidebar scrolling in Phase 5.
+    pub fn clamp_sidebar(&mut self, total: usize, viewport: usize) {
+        self.sidebar_offset = self.sidebar_offset.min(max_offset(total, viewport));
+    }
+}
+
 /// The finished state of a tool call (reference CLI: tool part `state.output`/`state.error`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutcome {
@@ -50,13 +193,21 @@ pub enum Item {
     User(String),
     Assistant(String),
     ToolCall {
+        /// Stable daemon id (the `ToolCallEvent.id`), so expansion state survives item insertion.
+        id: String,
         name: String,
         input: String,
         /// `None` while in flight; `Some` once the tool has finished.
         outcome: Option<ToolOutcome>,
     },
     Notice(String),
-    Reasoning(String),
+    Reasoning {
+        /// Stable block id (the block's `start_ms`, or the first delta's `seq`).
+        id: String,
+        text: String,
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+    },
     Error(String),
     Done(String),
 }
@@ -159,6 +310,8 @@ pub struct App {
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
     pub tick: u64,
+    /// Presentation-only state (focus, scroll, expansion, sidebar, model/context/mcp).
+    pub ui: UiState,
 }
 
 impl App {
@@ -191,6 +344,7 @@ impl App {
             files: Vec::new(),
             quit: false,
             tick: 0,
+            ui: UiState::default(),
         }
     }
 
@@ -321,6 +475,7 @@ impl App {
     pub fn record_shell(&mut self, command: String) {
         let input = serde_json::json!({ "command": command }).to_string();
         self.items.push(Item::ToolCall {
+            id: format!("shell-{}", self.tick),
             name: "Bash".to_string(),
             input,
             outcome: None,
@@ -593,6 +748,14 @@ impl App {
             Some(chat_event::Payload::SessionEnded(_)) => {
                 self.running = false;
             }
+            Some(chat_event::Payload::ConnectionStatusEvent(s)) => {
+                self.ui.lsp_enabled = s.lsp_enabled;
+                self.ui.mcp = s
+                    .mcp_servers
+                    .iter()
+                    .map(|m| (m.name.clone(), m.status.clone()))
+                    .collect();
+            }
             Some(chat_event::Payload::ToolPermissionRequest(r)) => {
                 self.flush_streaming();
                 self.pending = Some(Prompt::Permission {
@@ -635,6 +798,7 @@ impl App {
                     self.todos = parse_todos(&t.input);
                 }
                 self.items.push(Item::ToolCall {
+                    id: t.id.clone(),
                     name: t.name.clone(),
                     input: t.input.clone(),
                     outcome: None,
@@ -668,11 +832,12 @@ impl App {
                 // Usage is surfaced in the footer statusline, not the message scrollback
                 // (reference-CLI parity); the last sample is kept for rendering.
                 self.last_usage = Some((u.input_tokens, u.output_tokens, u.cost_usd));
+                // The resolved model + context window feed the status/context meters.
+                self.ui.model = u.model.clone();
+                self.ui.context_limit = u.context_limit.map(|v| v as u64);
             }
             Some(agent_event::Kind::Notice(n)) => self.items.push(Item::Notice(n.text.clone())),
-            Some(agent_event::Kind::Reasoning(r)) => {
-                self.items.push(Item::Reasoning(r.text.clone()))
-            }
+            Some(agent_event::Kind::Reasoning(r)) => self.apply_reasoning(r),
             Some(agent_event::Kind::Done(d)) => {
                 self.flush_streaming();
                 if let Some(result) = &d.result {
@@ -698,6 +863,39 @@ impl App {
         let text = std::mem::take(&mut self.streaming);
         if !text.is_empty() {
             self.items.push(Item::Assistant(text));
+        }
+    }
+
+    /// Accumulate one reasoning delta into the open reasoning block (or start a new one). Blocks are
+    /// keyed by `start_ms` (the daemon stamps the block start on every delta); a delta whose block
+    /// differs from the last open item starts a fresh block.
+    fn apply_reasoning(&mut self, r: &astra_proto::astra::engine::v1::ReasoningEvent) {
+        let appended = match self.items.last_mut() {
+            Some(Item::Reasoning {
+                text,
+                start_ms: last_start,
+                end_ms,
+                ..
+            }) if last_start == &r.start_ms => {
+                text.push_str(&r.text);
+                if r.end_ms.is_some() {
+                    *end_ms = r.end_ms;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !appended {
+            let id = r
+                .start_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| format!("r{}", r.seq));
+            self.items.push(Item::Reasoning {
+                id,
+                text: r.text.clone(),
+                start_ms: r.start_ms,
+                end_ms: r.end_ms,
+            });
         }
     }
 }
@@ -867,7 +1065,7 @@ mod tests {
             message: "boom".into(),
         })));
         assert!(matches!(app.items[0], Item::Notice(ref s) if s == "n"));
-        assert!(matches!(app.items[1], Item::Reasoning(ref s) if s == "r"));
+        assert!(matches!(app.items[1], Item::Reasoning { ref text, .. } if text == "r"));
         assert!(matches!(app.items[2], Item::Error(ref s) if s == "boom"));
         assert_eq!(app.error.as_deref(), Some("boom"));
         assert!(!app.running);
@@ -1164,5 +1362,175 @@ mod tests {
         app.mention_insert(&sel);
         assert!(app.mention.is_none());
         assert!(!app.input.contains('@'), "input: {}", app.input);
+    }
+
+    #[test]
+    fn scroll_state_offsets_clamp_and_follow_bottom() {
+        let mut s = ScrollState::at_bottom();
+        assert!(s.follow_bottom);
+
+        // Content that fits: max offset is zero.
+        s.on_content_changed(5, 20);
+        assert_eq!(s.offset, 0);
+        assert!(s.follow_bottom);
+
+        // Content that overflows: following sticks to the bottom.
+        s.on_content_changed(100, 20);
+        assert_eq!(s.offset, 80);
+        assert!(s.follow_bottom);
+
+        // Scrolling up disables auto-follow.
+        s.scroll_by(-10, 100, 20);
+        assert_eq!(s.offset, 70);
+        assert!(!s.follow_bottom);
+
+        // New content while NOT following does not move the viewport.
+        s.on_content_changed(200, 20);
+        assert_eq!(s.offset, 70);
+        assert!(!s.follow_bottom);
+
+        // Clamp handles a shrunken body (offset above the new max).
+        s.on_content_changed(50, 20);
+        assert_eq!(s.offset, 30);
+
+        // Home goes to zero and stays unfollowing (content overflows).
+        s.scroll_to_start(50, 20);
+        assert_eq!(s.offset, 0);
+        assert!(!s.follow_bottom);
+
+        // End goes to the bottom and resumes following.
+        s.scroll_to_end(50, 20);
+        assert_eq!(s.offset, 30);
+        assert!(s.follow_bottom);
+    }
+
+    #[test]
+    fn scroll_state_clamps_to_zero_and_max() {
+        let mut s = ScrollState {
+            offset: u16::MAX,
+            follow_bottom: false,
+        };
+        s.clamp(10, 5);
+        assert_eq!(s.offset, 5);
+
+        s.scroll_by(-999, 10, 5);
+        assert_eq!(s.offset, 0);
+
+        s.scroll_by(999, 10, 5);
+        assert_eq!(s.offset, 5);
+        assert!(s.follow_bottom, "reaching the bottom resumes following");
+    }
+
+    #[test]
+    fn scroll_state_landing_on_bottom_resumes_follow() {
+        let mut s = ScrollState::at_bottom();
+        s.on_content_changed(100, 20); // offset 80, following
+        s.scroll_by(-5, 100, 20); // offset 75, not following
+        assert!(!s.follow_bottom);
+        s.scroll_by(5, 100, 20); // back to 80 -> following again
+        assert!(s.follow_bottom);
+    }
+
+    #[test]
+    fn reasoning_deltas_accumulate_into_one_block() {
+        use astra_proto::astra::engine::v1::{agent_event, ReasoningEvent};
+
+        let mut app = App::new(vec![]);
+        // Three deltas of one block (same start_ms), the last carrying end_ms.
+        for (i, (text, start, end)) in [
+            ("Let ", Some(1000i64), None),
+            ("me ", Some(1000), None),
+            ("think", Some(1000), Some(1200)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let _ = i;
+            app.apply_agent_event(&ev(agent_event::Kind::Reasoning(ReasoningEvent {
+                text: (*text).to_string(),
+                seq: 0,
+                start_ms: *start,
+                end_ms: *end,
+            })));
+        }
+
+        // One accumulated block with the full text and the end bound.
+        assert_eq!(app.items.len(), 1);
+        match &app.items[0] {
+            Item::Reasoning {
+                text,
+                start_ms,
+                end_ms,
+                ..
+            } => {
+                assert_eq!(text, "Let me think");
+                assert_eq!(*start_ms, Some(1000));
+                assert_eq!(*end_ms, Some(1200));
+            }
+            other => panic!("expected a reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_items_carry_a_stable_daemon_id() {
+        use astra_proto::astra::engine::v1::{agent_event, ToolCallEvent};
+        let mut app = App::new(vec![]);
+        app.apply_agent_event(&ev(agent_event::Kind::ToolCall(ToolCallEvent {
+            id: "tc-1".into(),
+            name: "Read".into(),
+            input: "{}".into(),
+        })));
+        assert!(matches!(
+            app.items.first(),
+            Some(Item::ToolCall { id, .. }) if id == "tc-1"
+        ));
+    }
+
+    #[test]
+    fn connection_status_populates_model_context_and_mcp() {
+        use astra_proto::astra::engine::v1::{
+            agent_event, chat_event, ChatEvent, ConnectionStatusEvent, McpServerStatus, UsageEvent,
+        };
+        let mut app = App::new(vec![]);
+
+        let usage = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::AgentEvent(
+                astra_proto::astra::engine::v1::AgentEventEnvelope {
+                    protocol_version: 1.3,
+                    event: Some(ev(agent_event::Kind::Usage(UsageEvent {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cost_usd: Some(0.1),
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        model: Some("gpt-4o".into()),
+                        context_limit: Some(128_000),
+                    }))),
+                },
+            )),
+        };
+        app.apply_chat_event(&usage);
+        assert_eq!(app.ui.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(app.ui.context_limit, Some(128_000));
+
+        let status = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::ConnectionStatusEvent(
+                ConnectionStatusEvent {
+                    lsp_enabled: false,
+                    mcp_servers: vec![McpServerStatus {
+                        name: "srv".into(),
+                        status: "connected".into(),
+                    }],
+                },
+            )),
+        };
+        app.apply_chat_event(&status);
+        assert!(!app.ui.lsp_enabled);
+        assert_eq!(
+            app.ui.mcp,
+            vec![("srv".to_string(), "connected".to_string())]
+        );
     }
 }
