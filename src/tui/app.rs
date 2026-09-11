@@ -144,6 +144,9 @@ pub struct UiState {
     pub focus: Focus,
     pub transcript: ScrollState,
     pub sidebar_offset: u16,
+    /// The last measured sidebar content/viewport heights (set by render; read by the event layer).
+    pub sidebar_total: usize,
+    pub sidebar_viewport: usize,
     pub sidebar: SidebarMode,
     /// Tool items expanded past their bounded preview, keyed by stable tool id.
     pub expanded_tools: HashSet<String>,
@@ -169,6 +172,8 @@ impl Default for UiState {
             focus: Focus::Prompt,
             transcript: ScrollState::at_bottom(),
             sidebar_offset: 0,
+            sidebar_total: 0,
+            sidebar_viewport: 0,
             sidebar: SidebarMode::Hidden,
             expanded_tools: HashSet::new(),
             expanded_reasoning: HashSet::new(),
@@ -183,10 +188,18 @@ impl Default for UiState {
 }
 
 impl UiState {
-    /// Clamp the sidebar offset into `[0, max(total, viewport)]`.
-    #[allow(dead_code)] // wired into sidebar scrolling in Phase 5.
-    pub fn clamp_sidebar(&mut self, total: usize, viewport: usize) {
-        self.sidebar_offset = self.sidebar_offset.min(max_offset(total, viewport));
+    /// Clamp the sidebar offset into `[0, max(sidebar_total, sidebar_viewport)]`.
+    pub fn clamp_sidebar(&mut self) {
+        self.sidebar_offset = self
+            .sidebar_offset
+            .min(max_offset(self.sidebar_total, self.sidebar_viewport));
+    }
+
+    /// Scroll the sidebar by `delta` rows, clamped to the measured content/viewport heights.
+    pub fn scroll_sidebar(&mut self, delta: i32) {
+        let max = max_offset(self.sidebar_total, self.sidebar_viewport) as i32;
+        let next = (self.sidebar_offset as i32 + delta).clamp(0, max);
+        self.sidebar_offset = next as u16;
     }
 }
 
@@ -1562,6 +1575,24 @@ mod tests {
         assert!(app.ui.expanded_reasoning.contains("r"));
         // Tool and reasoning are independent sets.
         assert!(app.ui.expanded_tools.is_empty());
+    }
+
+    #[test]
+    fn sidebar_scroll_clamps_to_content_height() {
+        let mut app = App::new(vec![]);
+        app.ui.sidebar_total = 50;
+        app.ui.sidebar_viewport = 20;
+
+        app.ui.scroll_sidebar(100);
+        assert_eq!(app.ui.sidebar_offset, 30); // max(50, 20) = 30
+        app.ui.scroll_sidebar(-100);
+        assert_eq!(app.ui.sidebar_offset, 0);
+
+        // A shrunken sidebar clamps the offset down.
+        app.ui.sidebar_offset = 30;
+        app.ui.sidebar_total = 10;
+        app.ui.clamp_sidebar();
+        assert_eq!(app.ui.sidebar_offset, 0);
     }
 
     #[test]

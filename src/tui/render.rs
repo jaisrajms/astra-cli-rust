@@ -10,8 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use super::app::{App, Prompt, ToolStatus};
-use super::layout::Layout;
+use super::app::{App, Prompt, SidebarMode, ToolStatus};
+use super::layout::{Layout, SIDEBAR_WIDTH};
 use super::theme::{theme_at, Theme};
 use super::transcript;
 
@@ -75,7 +75,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_status(frame, app, footer, theme);
 
-    if let Some(sidebar) = layout.sidebar {
+    if let Some(sidebar) = layout.sidebar.or_else(|| {
+        // Force-dock the sidebar as a right-edge overlay on a narrow terminal.
+        if app.ui.sidebar == SidebarMode::Docked {
+            Some(super::layout::Rect {
+                x: area.width.saturating_sub(SIDEBAR_WIDTH),
+                y: 0,
+                width: SIDEBAR_WIDTH,
+                height: area.height,
+            })
+        } else {
+            None
+        }
+    }) {
         render_sidebar(
             frame,
             app,
@@ -210,6 +222,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         app.current_agent(),
         Style::default().fg(theme.accent).bold(),
     )];
+    if let Some(model) = &app.ui.model {
+        spans.push(Span::styled(
+            format!(" · {model}"),
+            Style::default().fg(theme.dim),
+        ));
+    }
     spans.push(Span::styled(
         format!("  {}", theme.name),
         Style::default().fg(theme.dim),
@@ -330,7 +348,7 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
 }
 
-fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+fn render_sidebar(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let title = app.title.clone().unwrap_or_else(|| "Astra".to_string());
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -340,29 +358,69 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Line::from(""),
     ];
 
-    // Context (the reference CLI's sidebar-context feature): tokens + spend.
-    if let Some((input, output, cost)) = app.last_usage {
+    // Context (the reference CLI's sidebar-context feature): model, tokens, % used, spend.
+    if app.last_usage.is_some() || app.ui.model.is_some() {
         lines.push(Line::from(Span::styled("Context", Style::default().bold())));
-        let tokens = input + output;
-        lines.push(Line::from(Span::styled(
-            format!("{tokens} tokens"),
-            Style::default().fg(theme.dim),
-        )));
-        if let Some(cost) = cost {
+        if let Some(model) = &app.ui.model {
             lines.push(Line::from(Span::styled(
-                format!("${cost:.4} spent"),
+                model.clone(),
                 Style::default().fg(theme.dim),
             )));
+        }
+        if let Some((input, output, cost)) = app.last_usage {
+            let tokens = input + output;
+            lines.push(Line::from(Span::styled(
+                format!("{tokens} tokens"),
+                Style::default().fg(theme.dim),
+            )));
+            if let Some(limit) = app.ui.context_limit {
+                let pct = if limit > 0 {
+                    (tokens as f64 / limit as f64 * 100.0) as u64
+                } else {
+                    0
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{pct}% used"),
+                    Style::default().fg(theme.dim),
+                )));
+            }
+            if let Some(cost) = cost {
+                lines.push(Line::from(Span::styled(
+                    format!("${cost:.4} spent"),
+                    Style::default().fg(theme.dim),
+                )));
+            }
         }
         lines.push(Line::from(""));
     }
 
-    // LSP (the reference CLI's sidebar-lsp feature): no servers are wired, so always disabled.
+    // LSP: the tool is an injected seam, so no server is attached.
     lines.push(Line::from(Span::styled("LSP", Style::default().bold())));
     lines.push(Line::from(Span::styled(
-        "LSPs are disabled",
+        if app.ui.lsp_enabled {
+            "connected"
+        } else {
+            "LSPs are disabled"
+        },
         Style::default().fg(theme.dim),
     )));
+
+    // MCP servers (from the ConnectionStatusEvent snapshot).
+    if !app.ui.mcp.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("MCP", Style::default().bold())));
+        for (name, status) in &app.ui.mcp {
+            let dot = if status == "connected" {
+                theme.ok
+            } else {
+                theme.err
+            };
+            lines.push(Line::from(vec![
+                Span::styled("• ", Style::default().fg(dot)),
+                Span::styled(format!("{name} {status}"), Style::default().fg(theme.dim)),
+            ]));
+        }
+    }
 
     // Todo (the reference CLI's sidebar-todo feature): the current session task list.
     if !app.todos.is_empty() {
@@ -381,7 +439,24 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         }
     }
 
-    let paragraph = Paragraph::new(lines)
+    // Measure + scroll the sidebar independently of the transcript.
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let wrapped: Vec<Line> = lines
+        .into_iter()
+        .flat_map(|l| transcript::wrap_line(l, inner_width))
+        .collect();
+    app.ui.sidebar_total = wrapped.len();
+    app.ui.sidebar_viewport = inner_height;
+    app.ui.clamp_sidebar();
+    let offset = app.ui.sidebar_offset as usize;
+    let visible: Vec<Line> = wrapped
+        .into_iter()
+        .skip(offset)
+        .take(inner_height)
+        .collect();
+
+    let paragraph = Paragraph::new(visible)
         .block(Block::default().borders(Borders::LEFT).title(" session "))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);

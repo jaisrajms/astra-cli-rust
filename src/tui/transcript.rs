@@ -71,7 +71,7 @@ pub fn measure(app: &App, width: u16, theme: Theme) -> Vec<MeasuredRow> {
 /// Wrap one `Line` at `width` columns, preserving leading indentation on the first row. A line that
 /// already fits is returned as-is (keeping its span styling); a wrapped line is rebuilt as plain
 /// rows (the common wrapped content — prose/code/output — is single-styled anyway).
-fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let text = line.to_string();
     if width == 0 || display_width(&text) <= width {
         return vec![line];

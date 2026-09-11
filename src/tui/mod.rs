@@ -37,7 +37,7 @@ use astra_proto::astra::engine::v1::{
 };
 use astra_proto::SessionId;
 
-use self::app::{App, Prompt};
+use self::app::{App, Prompt, SidebarMode};
 use self::event::{route, UiCommand};
 use self::stream::DaemonEvent;
 
@@ -165,9 +165,7 @@ async fn apply_command(
             app.ui.transcript.scroll_by(delta, total, viewport);
         }
         UiCommand::ScrollSidebar(delta) => {
-            // TODO(Phase 5): scroll against the measured sidebar height.
-            let next = app.ui.sidebar_offset as i32 + delta;
-            app.ui.sidebar_offset = next.clamp(0, u16::MAX as i32) as u16;
+            app.ui.scroll_sidebar(delta);
         }
         UiCommand::TranscriptStart => {
             let (total, viewport) = (app.ui.transcript.total, app.ui.transcript.viewport);
@@ -179,6 +177,12 @@ async fn apply_command(
         }
         UiCommand::Focus(focus) => app.ui.focus = focus,
         UiCommand::ToggleExpand(item) => app.toggle_expanded(&item),
+        UiCommand::ToggleSidebar => {
+            app.ui.sidebar = match app.ui.sidebar {
+                SidebarMode::Hidden => SidebarMode::Docked,
+                _ => SidebarMode::Hidden,
+            };
+        }
         UiCommand::Insert(c) => app.push_char(c),
         UiCommand::Backspace => app.backspace(),
         UiCommand::DeleteForward => app.delete_forward(),

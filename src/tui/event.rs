@@ -30,6 +30,8 @@ pub enum UiCommand {
     Focus(Focus),
     /// Toggle the expansion of a tool/reasoning block.
     ToggleExpand(RowItem),
+    /// Toggle the sidebar visibility (force-dock on narrow, or hide on wide).
+    ToggleSidebar,
     // Prompt editing.
     Insert(char),
     Backspace,
@@ -94,6 +96,8 @@ fn route_key(key: &KeyEvent, app: &App) -> UiCommand {
         KeyCode::Char('c') if ctrl => UiCommand::Quit,
         // Command palette (leader key Ctrl-X).
         KeyCode::Char('x') if ctrl => UiCommand::PaletteToggle,
+        // Sidebar toggle (Ctrl-B).
+        KeyCode::Char('b') if ctrl => UiCommand::ToggleSidebar,
         KeyCode::Esc if app.palette.is_some() => UiCommand::PaletteClose,
         KeyCode::Enter if app.palette.is_some() => UiCommand::PaletteChoose,
         KeyCode::Up if app.palette.is_some() => UiCommand::PaletteUp,
