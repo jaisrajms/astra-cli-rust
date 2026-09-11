@@ -30,20 +30,64 @@ fn runs(text: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// Append `s` to the current row one character at a time, flushing full rows.
-fn fill(s: &str, width: usize, cur: &mut String, cur_width: &mut usize, rows: &mut Vec<String>) {
+/// Hard-break `s` into chunks of at most `width` display columns. Used for words wider than a row.
+fn hard_break(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_w = 0usize;
     for ch in s.chars() {
         let cw = ch.width().unwrap_or(0);
-        if !cur.is_empty() && *cur_width + cw > width {
-            rows.push(std::mem::take(cur));
-            *cur_width = 0;
+        if chunk_w + cw > width && !chunk.is_empty() {
+            out.push(std::mem::take(&mut chunk));
+            chunk_w = 0;
         }
-        cur.push(ch);
-        *cur_width += cw;
+        chunk.push(ch);
+        chunk_w += cw;
     }
+    if !chunk.is_empty() {
+        out.push(chunk);
+    }
+    out
 }
 
-/// Wrap `text` into visual rows of at most `width` display columns.
+/// Hard-break `s` with a narrower first chunk (`first` columns) and `rest`-column chunks after.
+fn hard_break_prefix(s: &str, first: usize, rest: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_w = 0usize;
+    let mut limit = first;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if chunk_w + cw > limit && !chunk.is_empty() {
+            out.push(std::mem::take(&mut chunk));
+            chunk_w = 0;
+            limit = rest;
+        }
+        chunk.push(ch);
+        chunk_w += cw;
+    }
+    if !chunk.is_empty() {
+        out.push(chunk);
+    }
+    out
+}
+
+/// Merge a word (or its first hard-broken chunk) into the current row, which holds only leading
+/// indentation, so the indentation stays attached to the first visual row.
+fn merge_into_indent(run: &str, cur: &mut String, rows: &mut Vec<String>, width: usize) {
+    let avail = width.saturating_sub(display_width(cur));
+    let chunks = hard_break_prefix(run, avail.max(1), width);
+    if let Some(first) = chunks.first() {
+        cur.push_str(first);
+    }
+    rows.push(std::mem::take(cur));
+    rows.extend(chunks.into_iter().skip(1));
+}
+
+/// Wrap `text` into visual rows of at most `width` display columns, preserving whitespace runs
+/// verbatim (multiple spaces/tabs are never collapsed). Whitespace is held with the following word;
+/// the separator at a wrap point is consumed by the line break, and leading indentation stays on the
+/// first row.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -55,44 +99,68 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_width = 0usize;
-    let mut has_word = false;
+    let mut pending_ws = String::new();
 
     for (run, is_ws) in runs(text) {
         if is_ws {
-            // Leading whitespace is preserved on the first row only; internal/trailing
-            // whitespace collapses to a single space at the next word boundary.
-            if !has_word && rows.is_empty() {
-                fill(&run, width, &mut cur, &mut cur_width, &mut rows);
+            // Leading whitespace of a fresh row is indentation; internal whitespace is held back so
+            // it is only committed when the next word fits on the same row.
+            if cur.is_empty() {
+                cur.push_str(&run);
+                cur_width += display_width(&run);
+            } else {
+                pending_ws.push_str(&run);
             }
             continue;
         }
 
-        let word_width = display_width(&run);
-        if has_word {
-            if cur_width + 1 + word_width <= width {
-                cur.push(' ');
-                cur.push_str(&run);
-                cur_width += 1 + word_width;
-            } else {
-                rows.push(std::mem::take(&mut cur));
+        let word_w = display_width(&run);
+
+        // A word wider than a whole row is hard-broken (its pending separator is dropped).
+        if word_w > width {
+            if cur.chars().all(char::is_whitespace) {
+                merge_into_indent(&run, &mut cur, &mut rows, width);
                 cur_width = 0;
-                fill(&run, width, &mut cur, &mut cur_width, &mut rows);
-                has_word = true;
+            } else {
+                if !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_width = 0;
+                }
+                rows.extend(hard_break(&run, width));
             }
-        } else if cur_width + word_width <= width {
-            cur.push_str(&run);
-            cur_width += word_width;
-            has_word = true;
-        } else {
-            fill(&run, width, &mut cur, &mut cur_width, &mut rows);
-            has_word = true;
+            pending_ws.clear();
+            continue;
         }
+
+        let ws_w = display_width(&pending_ws);
+        if cur_width + ws_w + word_w <= width {
+            // Fits: commit the pending whitespace verbatim, then the word.
+            cur.push_str(&pending_ws);
+            cur.push_str(&run);
+            cur_width += ws_w + word_w;
+        } else {
+            // Doesn't fit. If the current row is only indentation, merge the word's first chunk into
+            // it so the indent stays attached; otherwise start a fresh row.
+            if cur.chars().all(char::is_whitespace) {
+                merge_into_indent(&run, &mut cur, &mut rows, width);
+                cur_width = 0;
+            } else {
+                if !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                }
+                cur.push_str(&run);
+                cur_width = word_w;
+            }
+        }
+        pending_ws.clear();
     }
 
     if !cur.is_empty() {
         rows.push(cur);
     }
-
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
     rows
 }
 
@@ -163,8 +231,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_collapses_to_space() {
-        check("a\tb", 10, &["a b"]);
+    fn tab_is_preserved() {
+        check("a\tb", 10, &["a\tb"]);
+    }
+
+    #[test]
+    fn multiple_spaces_are_preserved() {
+        check("a  b", 20, &["a  b"]);
+        // Two spaces kept on the row that fits; the separator at the wrap point is consumed.
+        check("a  b  c", 4, &["a  b", "c"]);
     }
 
     #[test]
