@@ -8,6 +8,8 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::Context;
 use clap::Args;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -18,7 +20,7 @@ use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::session_service_client::SessionServiceClient;
 use astra_proto::astra::engine::v1::{
     agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent,
-    ForkSessionRequest, ListSessionsRequest, SendMessage,
+    ForkSessionRequest, ListSessionsRequest, ResolveAskUser, ResolveToolPermission, SendMessage,
 };
 use astra_proto::{MessageId, SessionId};
 
@@ -71,6 +73,7 @@ pub struct RenderConfig {
     pub model: Option<String>,
     pub thinking: bool,
     pub json: bool,
+    pub auto: bool,
 }
 
 pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
@@ -78,6 +81,7 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
     let session_id = resolve_session(&args, channel.clone()).await?;
 
     let mut chat = ChatServiceClient::new(channel);
+    let (sink, outbound_rx) = mpsc::channel::<ChatClientMsg>(8);
     let msg = ChatClientMsg {
         session_id: session_id.map(|v| SessionId { value: v }),
         payload: Some(chat_client_msg::Payload::SendMessage(SendMessage {
@@ -88,8 +92,11 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
             exec: args.exec.clone(),
         })),
     };
+    sink.send(msg)
+        .await
+        .map_err(|_| anyhow::anyhow!("chat stream closed"))?;
 
-    let outbound = futures::stream::iter(std::iter::once(msg));
+    let outbound = ReceiverStream::new(outbound_rx);
     let resp = chat
         .stream_chat(with_workspace(Request::new(outbound)))
         .await?;
@@ -100,17 +107,19 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
         model: args.model.clone(),
         thinking: args.thinking,
         json: args.format == "json",
+        auto: args.auto || args.yolo,
     };
-    consume_stream(stream, std::io::stdout(), std::io::stderr(), config).await
+    consume_stream(stream, std::io::stdout(), std::io::stderr(), config, sink).await
 }
 
-/// Consume the chat stream, rendering each event. The terminal `Done` event is
-/// rendered (so its `result` is emitted) before the loop breaks.
+/// Consume the chat stream, rendering each event and auto-resolving any interactive request
+/// (permission / ask-user) — allow with `--auto`, reject otherwise (non-interactive `run`).
 async fn consume_stream<S, W, E>(
     mut stream: S,
     out: W,
     err: E,
     config: RenderConfig,
+    sink: mpsc::Sender<ChatClientMsg>,
 ) -> anyhow::Result<()>
 where
     S: futures::Stream<Item = Result<ChatEvent, tonic::Status>> + Unpin,
@@ -127,6 +136,11 @@ where
     };
     while let Some(event) = stream.next().await {
         let event = event?;
+        if let Some(resolver) = auto_resolve(&event, renderer.config.auto) {
+            sink.send(resolver)
+                .await
+                .map_err(|_| anyhow::anyhow!("chat stream closed"))?;
+        }
         let is_done = done(&event);
         renderer.render(&event);
         if is_done {
@@ -134,6 +148,31 @@ where
         }
     }
     Ok(())
+}
+
+/// Build the resolver verb for an interactive request (permission / ask-user), auto-rejecting (or
+/// auto-allowing with `auto`) in non-interactive mode.
+fn auto_resolve(event: &ChatEvent, auto: bool) -> Option<ChatClientMsg> {
+    match &event.payload {
+        Some(chat_event::Payload::ToolPermissionRequest(r)) => Some(ChatClientMsg {
+            session_id: event.session_id.clone(),
+            payload: Some(chat_client_msg::Payload::ResolveToolPermission(
+                ResolveToolPermission {
+                    id: r.id.clone(),
+                    allow: auto,
+                    persist: String::new(),
+                },
+            )),
+        }),
+        Some(chat_event::Payload::AskUserRequest(r)) => Some(ChatClientMsg {
+            session_id: event.session_id.clone(),
+            payload: Some(chat_client_msg::Payload::ResolveAskUser(ResolveAskUser {
+                id: r.id.clone(),
+                answer: String::new(),
+            })),
+        }),
+        _ => None,
+    }
 }
 
 /// The stateful `run` renderer: header-once, text→stdout, tool/thinking→stderr.
@@ -404,7 +443,13 @@ mod tests {
             model: Some("deepseek/deepseek-chat".to_string()),
             thinking: false,
             json: false,
+            auto: false,
         }
+    }
+
+    fn sink() -> mpsc::Sender<ChatClientMsg> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
     }
 
     #[derive(Clone)]
@@ -466,8 +511,11 @@ mod tests {
             &self,
             request: tonic::Request<Streaming<ChatClientMsg>>,
         ) -> Result<Response<Self::StreamChatStream>, Status> {
+            // Read the FIRST inbound message (the prompt) and reply; the client keeps the bidi
+            // stream open to resolve interactive requests, so do NOT drain to EOF here (that would
+            // deadlock the handle loop).
             let mut inbound = request.into_inner();
-            while let Some(msg) = inbound.message().await? {
+            if let Some(msg) = inbound.message().await? {
                 if let Some(chat_client_msg::Payload::SendMessage(sm)) = msg.payload {
                     self.received.lock().unwrap().push(sm);
                 }
@@ -563,7 +611,7 @@ mod tests {
         ]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        consume_stream(stream, &mut out, &mut err, config())
+        consume_stream(stream, &mut out, &mut err, config(), sink())
             .await
             .expect("stream should consume");
 
@@ -591,7 +639,7 @@ mod tests {
         ]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        consume_stream(stream, &mut out, &mut err, config())
+        consume_stream(stream, &mut out, &mut err, config(), sink())
             .await
             .expect("stream should consume");
         let text = String::from_utf8(out).unwrap();
@@ -619,7 +667,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<_, Status>(bad)]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        consume_stream(stream, &mut out, &mut err, config())
+        consume_stream(stream, &mut out, &mut err, config(), sink())
             .await
             .expect("stream should consume");
         assert!(out.is_empty(), "incompatible event must not be rendered");
