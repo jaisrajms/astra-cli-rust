@@ -1,6 +1,6 @@
 //! `astra run [message..]` — one-shot message over the chat stream.
 //!
-//! Output parity with opencode `run`: a single `> {agent} · {model}` header on
+//! Output parity with the reference CLI's `run`: a single `> {agent} · {model}` header on
 //! stderr, the assistant's text on stdout, `Thinking:` reasoning, inline tool
 //! calls on stderr, and no `[usage]`/`[tool]` marker noise.
 
@@ -197,7 +197,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = writeln!(self.err);
     }
 
-    /// Flush the accumulated text as one finalized part (trimmed), matching opencode's
+    /// Flush the accumulated text as one finalized part (trimmed), matching the reference CLI's
     /// finalized-text-part output.
     fn flush_text(&mut self) {
         let text = self.text_buf.trim().to_string();
@@ -247,7 +247,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
                 }
             }
             Some(agent_event::Kind::ToolResult(t)) => {
-                // opencode `run` is quiet on success; only failures are surfaced.
+                // the reference CLI's `run` is quiet on success; only failures are surfaced.
                 if t.is_error {
                     let _ = writeln!(self.err, "✗ {} failed", t.name);
                     if !t.summary.is_empty() {
@@ -273,7 +273,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         }
     }
 
-    /// Emit one JSON event line (opencode `--format json` shape).
+    /// Emit one JSON event line (the reference CLI's `--format json` shape).
     fn emit(&mut self, ty: &str, data: serde_json::Value) {
         let mut obj = data;
         if let Some(map) = obj.as_object_mut() {
@@ -596,7 +596,7 @@ mod tests {
             .expect("stream should consume");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("hi"), "text rendered: {text}");
-        // The Done result is NOT re-printed (opencode prints text parts, not a `result`).
+        // The Done result is NOT re-printed (the reference CLI prints text parts, not a `result`).
         assert!(
             !text.contains("final answer"),
             "done result not duplicated: {text}"

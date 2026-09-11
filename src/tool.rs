@@ -1,9 +1,9 @@
 //! Tool display metadata shared by `run` and the TUI: the per-tool inline icon
-//! and a title summarizing a tool call's arguments (opencode's `run/tool.ts`).
+//! and a title summarizing a tool call's arguments (the reference CLI's `run/tool.ts`).
 
 use serde_json::Value;
 
-/// The inline glyph for a tool (opencode's tool-icon set).
+/// The inline glyph for a tool (the reference CLI's tool-icon set).
 pub fn tool_icon(name: &str) -> &'static str {
     match name {
         "Read" => "→",
@@ -21,7 +21,7 @@ pub fn tool_icon(name: &str) -> &'static str {
 }
 
 /// Summarize a tool call's JSON-stringified input as `[key=value, ...]` for
-/// primitive fields (opencode's inline `[args]` summary).
+/// primitive fields (the reference CLI's inline `[args]` summary).
 pub fn summarize_input(input: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(input) else {
         return String::new();

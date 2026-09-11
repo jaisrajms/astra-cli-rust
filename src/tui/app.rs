@@ -348,7 +348,7 @@ impl App {
             }
             Some(agent_event::Kind::Usage(u)) => {
                 // Usage is surfaced in the footer statusline, not the message scrollback
-                // (opencode parity); the last sample is kept for rendering.
+                // (reference-CLI parity); the last sample is kept for rendering.
                 self.last_usage = Some((u.input_tokens, u.output_tokens, u.cost_usd));
             }
             Some(agent_event::Kind::Notice(n)) => self.items.push(Item::Notice(n.text.clone())),
