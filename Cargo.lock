@@ -93,6 +93,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "libc",
  "ratatui",
  "serde_json",
  "termios",

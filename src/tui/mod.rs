@@ -58,8 +58,8 @@ impl Drop for MouseCaptureGuard {
     }
 }
 
-/// Enter the full-screen TUI. Blocks until the user quits (Ctrl-C / `q` / Esc)
-/// or the daemon stream closes.
+/// Enter the full-screen TUI. Blocks until the user quits (Ctrl-C / Esc) or the daemon stream
+/// closes.
 pub async fn run(channel: Channel) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init().context("failed to initialize the terminal")?;
     let capture = match MouseCaptureGuard::enable() {
@@ -70,7 +70,10 @@ pub async fn run(channel: Channel) -> anyhow::Result<()> {
             return Err(e).context("failed to enable mouse capture");
         }
     };
-    let result = run_inner(&mut terminal, channel).await;
+    // Detect the terminal background (env vars, then an OSC 11 query) while in raw mode and before
+    // the crossterm event stream is created, so the raw reply read does not contend with it.
+    let theme_index = theme::detect_theme_index();
+    let result = run_inner(&mut terminal, channel, theme_index).await;
     drop(capture);
     ratatui::restore();
     result
@@ -79,9 +82,11 @@ pub async fn run(channel: Channel) -> anyhow::Result<()> {
 async fn run_inner(
     terminal: &mut ratatui::DefaultTerminal,
     channel: Channel,
+    theme_index: usize,
 ) -> anyhow::Result<()> {
     let agents = load_agents(&channel).await;
     let mut app = App::new(agents);
+    app.theme_index = theme_index;
     // Pre-scan the workspace for @-file mentions (bounded; run once at startup).
     if let Ok(cwd) = std::env::current_dir() {
         app.set_files(scan_workspace_files(&cwd, 300));
