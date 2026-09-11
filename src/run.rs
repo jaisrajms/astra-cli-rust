@@ -511,6 +511,8 @@ mod tests {
                         cost_usd: None,
                         cache_read_tokens: None,
                         cache_write_tokens: None,
+                        model: None,
+                        context_limit: None,
                     })),
                 }),
             })),

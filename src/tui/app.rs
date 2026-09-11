@@ -764,6 +764,8 @@ mod tests {
             cost_usd: Some(0.0042),
             cache_read_tokens: None,
             cache_write_tokens: None,
+            model: None,
+            context_limit: None,
         }))
     }
 
@@ -858,6 +860,8 @@ mod tests {
         app.apply_agent_event(&ev(agent_event::Kind::Reasoning(ReasoningEvent {
             text: "r".into(),
             seq: 0,
+            start_ms: None,
+            end_ms: None,
         })));
         app.apply_agent_event(&ev(agent_event::Kind::Error(ErrorEvent {
             message: "boom".into(),
