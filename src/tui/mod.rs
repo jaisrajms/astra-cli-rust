@@ -185,6 +185,20 @@ async fn handle_terminal_event(
                 }
                 None => {
                     if let Some(content) = app.submit() {
+                        // `!`-prefixed input runs a LOCAL shell command (not through the LLM).
+                        if let Some(cmd) = content.strip_prefix('!').map(str::trim) {
+                            if !cmd.is_empty() {
+                                app.record_shell(cmd.to_string());
+                                let out = tokio::task::spawn_blocking({
+                                    let cmd = cmd.to_string();
+                                    move || run_local_shell(&cmd)
+                                })
+                                .await
+                                .unwrap_or_else(|_| ("(shell task failed)".to_string(), false));
+                                app.record_shell_output(out.0, out.1);
+                            }
+                            return Ok(());
+                        }
                         let agent = app.current_agent().to_string();
                         app.begin_turn(content.clone());
                         let sid = session_id.lock().unwrap().clone();
@@ -239,6 +253,27 @@ fn build_send_message(session_id: Option<String>, content: String, agent: &str) 
             images: Vec::new(),
             exec: None,
         })),
+    }
+}
+
+/// Run a command in the local shell (`sh -c`), returning `(output, ok)`.
+fn run_local_shell(command: &str) -> (String, bool) {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+    {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let text = if !stdout.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            };
+            (text, o.status.success())
+        }
+        Err(e) => (format!("failed to run: {e}"), false),
     }
 }
 

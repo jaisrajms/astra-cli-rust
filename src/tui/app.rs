@@ -260,6 +260,24 @@ impl App {
         self.cursor = self.input.chars().count();
     }
 
+    // --- shell mode ---
+
+    /// Record a shell-mode command (`!command`) as a user line.
+    pub fn record_shell(&mut self, command: String) {
+        self.items.push(Item::User(format!("!{command}")));
+    }
+
+    /// Record the output of a local shell command as a tool-result line.
+    pub fn record_shell_output(&mut self, output: String, ok: bool) {
+        let summary = if ok { "exit 0" } else { "failed" }.to_string();
+        self.items.push(Item::ToolResult {
+            name: "shell".to_string(),
+            summary,
+            ok,
+            output,
+        });
+    }
+
     // --- agent picker ---
 
     pub fn next_agent(&mut self) {
