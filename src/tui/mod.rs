@@ -9,6 +9,7 @@
 //! `astra` with no arguments dispatches to [`run`] (see `main.rs`).
 
 pub mod app;
+pub mod event;
 pub mod render;
 mod stream;
 pub mod theme;
@@ -24,7 +25,6 @@ use tonic::Request;
 
 use crate::endpoint::with_workspace;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 
 use astra_proto::astra::engine::v1::agent_service_client::AgentServiceClient;
@@ -34,13 +34,40 @@ use astra_proto::astra::engine::v1::{
 use astra_proto::SessionId;
 
 use self::app::{App, Prompt};
+use self::event::{route, UiCommand};
 use self::stream::DaemonEvent;
+
+/// An RAII guard that enables crossterm mouse capture on construction and disables it on drop, so a
+/// wheel event never falls through to the terminal emulator's scrollback (Plan §6.1).
+struct MouseCaptureGuard;
+
+impl MouseCaptureGuard {
+    fn enable() -> anyhow::Result<Self> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
 
 /// Enter the full-screen TUI. Blocks until the user quits (Ctrl-C / `q` / Esc)
 /// or the daemon stream closes.
 pub async fn run(channel: Channel) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init().context("failed to initialize the terminal")?;
+    let capture = match MouseCaptureGuard::enable() {
+        Ok(capture) => capture,
+        Err(e) => {
+            // Restore the terminal (already in raw mode) before failing out.
+            ratatui::restore();
+            return Err(e).context("failed to enable mouse capture");
+        }
+    };
     let result = run_inner(&mut terminal, channel).await;
+    drop(capture);
     ratatui::restore();
     result
 }
@@ -62,15 +89,18 @@ async fn run_inner(
     // a clean error before the UI paints anything.
     let (sink, mut event_rx) = stream::spawn(channel).await?;
 
-    let mut key_events = crossterm::event::EventStream::new();
+    let mut term_events = crossterm::event::EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            key_event = key_events.next() => {
-                match key_event {
-                    Some(Ok(event)) => handle_terminal_event(&mut app, event, &sink, &session_id).await?,
+            term_event = term_events.next() => {
+                match term_event {
+                    Some(Ok(event)) => {
+                        let command = route(&event, &app);
+                        apply_command(&mut app, command, &sink, &session_id).await?;
+                    }
                     Some(Err(_)) => {}
                     None => break,
                 }
@@ -114,32 +144,43 @@ async fn run_inner(
     Ok(())
 }
 
-/// Translate one terminal event into `App` mutations. Sending a submitted
-/// message is the only daemon interaction here.
-async fn handle_terminal_event(
+/// Apply one routed [`UiCommand`]: mutate `App` and/or send a daemon message. This is the
+/// side-effectful half of the input path (event routing is the pure [`route`] function).
+async fn apply_command(
     app: &mut App,
-    event: Event,
+    command: UiCommand,
     sink: &mpsc::Sender<ChatClientMsg>,
     session_id: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-
-    if key.kind == KeyEventKind::Release {
-        return Ok(());
-    }
-
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit();
+    match command {
+        UiCommand::Noop => {}
+        UiCommand::ScrollTranscript(delta) => {
+            // TODO(Phase 3): scroll against the measured transcript height; here the placeholder
+            // total is zero, so the offset stays pinned at the top until measurement lands.
+            app.ui.transcript.scroll_by(delta, 0, 0);
         }
-        // Command palette (leader key Ctrl-X).
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.toggle_palette();
+        UiCommand::ScrollSidebar(delta) => {
+            // TODO(Phase 5): scroll against the measured sidebar height.
+            let next = app.ui.sidebar_offset as i32 + delta as i32;
+            app.ui.sidebar_offset = next.clamp(0, u16::MAX as i32) as u16;
         }
-        KeyCode::Esc if app.palette.is_some() => app.palette = None,
-        KeyCode::Enter if app.palette.is_some() => {
+        UiCommand::Insert(c) => app.push_char(c),
+        UiCommand::Backspace => app.backspace(),
+        UiCommand::DeleteForward => app.delete_forward(),
+        UiCommand::CursorLeft => app.cursor_left(),
+        UiCommand::CursorRight => app.cursor_right(),
+        UiCommand::CursorHome => app.cursor_home(),
+        UiCommand::CursorEnd => app.cursor_end(),
+        UiCommand::RecallOlder => app.recall_older(),
+        UiCommand::RecallNewer => app.recall_newer(),
+        UiCommand::NextAgent => app.next_agent(),
+        UiCommand::PrevAgent => app.prev_agent(),
+        UiCommand::NextTheme => app.next_theme(),
+        UiCommand::PaletteToggle => app.toggle_palette(),
+        UiCommand::PaletteClose => app.palette = None,
+        UiCommand::PaletteUp => app.palette_up(),
+        UiCommand::PaletteDown => app.palette_down(),
+        UiCommand::PaletteChoose => {
             let label = app.palette_selected();
             app.palette = None;
             match label {
@@ -153,125 +194,19 @@ async fn handle_terminal_event(
                 _ => {}
             }
         }
-        KeyCode::Up if app.palette.is_some() => app.palette_up(),
-        KeyCode::Down if app.palette.is_some() => app.palette_down(),
-        // @-mention popup.
-        KeyCode::Esc if app.mention.is_some() => app.mention_dismiss(),
-        KeyCode::Enter if app.mention.is_some() => {
+        UiCommand::MentionOpen => {
+            app.push_char('@');
+            app.open_mention();
+        }
+        UiCommand::MentionSelect => {
             if let Some(item) = app.mention_selected() {
                 app.mention_insert(&item);
             }
         }
-        KeyCode::Tab if app.mention.is_some() => {
-            if let Some(item) = app.mention_selected() {
-                app.mention_insert(&item);
-            }
-        }
-        KeyCode::Up if app.mention.is_some() => app.mention_up(),
-        KeyCode::Down if app.mention.is_some() => app.mention_down(),
-        KeyCode::Esc => {
-            let sid = session_id.lock().unwrap().clone();
-            match app.pending.clone() {
-                Some(Prompt::Permission { .. }) => {
-                    if let Some(msg) = app.resolve_permission(false, sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                Some(Prompt::Question { .. }) => {
-                    if let Some(msg) = app.resolve_question(String::new(), sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                Some(Prompt::DiffReview { .. }) => {
-                    if let Some(msg) = app.resolve_diff_review("reject", None, sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                None => app.request_quit(),
-            }
-        }
-        KeyCode::Enter => {
-            let sid = session_id.lock().unwrap().clone();
-            match app.pending.clone() {
-                Some(Prompt::Permission { .. }) => {
-                    if let Some(msg) = app.resolve_permission(true, sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                Some(Prompt::Question { .. }) => {
-                    let answer = app.input.trim().to_string();
-                    app.input.clear();
-                    app.cursor = 0;
-                    if let Some(msg) = app.resolve_question(answer, sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                Some(Prompt::DiffReview { .. }) => {
-                    if let Some(msg) = app.resolve_diff_review("accept", None, sid) {
-                        sink.send(msg).await.context("chat stream closed")?;
-                    }
-                }
-                None => {
-                    if let Some(content) = app.submit() {
-                        // `!`-prefixed input runs a LOCAL shell command (not through the LLM).
-                        if let Some(cmd) = content.strip_prefix('!').map(str::trim) {
-                            if !cmd.is_empty() {
-                                app.record_shell(cmd.to_string());
-                                let out = tokio::task::spawn_blocking({
-                                    let cmd = cmd.to_string();
-                                    move || run_local_shell(&cmd)
-                                })
-                                .await
-                                .unwrap_or_else(|_| ("(shell task failed)".to_string(), false));
-                                app.record_shell_output(out.0, out.1);
-                            }
-                            return Ok(());
-                        }
-                        let agent = app.current_agent().to_string();
-                        app.begin_turn(content.clone());
-                        let sid = session_id.lock().unwrap().clone();
-                        sink.send(build_send_message(sid, content, &agent))
-                            .await
-                            .context("chat stream closed")?;
-                    }
-                }
-            }
-        }
-        KeyCode::Char('y') if matches!(app.pending, Some(Prompt::Permission { .. })) => {
-            let sid = session_id.lock().unwrap().clone();
-            if let Some(msg) = app.resolve_permission(true, sid) {
-                sink.send(msg).await.context("chat stream closed")?;
-            }
-        }
-        KeyCode::Char('n') if matches!(app.pending, Some(Prompt::Permission { .. })) => {
-            let sid = session_id.lock().unwrap().clone();
-            if let Some(msg) = app.resolve_permission(false, sid) {
-                sink.send(msg).await.context("chat stream closed")?;
-            }
-        }
-        // Edit-in-chat: open the proposed content in $EDITOR and resolve with the edited text.
-        KeyCode::Char('e') if matches!(app.pending, Some(Prompt::DiffReview { .. })) => {
-            if let Some(content) = edit_diff_review_content(app) {
-                let sid = session_id.lock().unwrap().clone();
-                if let Some(msg) = app.resolve_diff_review("edit", Some(content), sid) {
-                    sink.send(msg).await.context("chat stream closed")?;
-                }
-            }
-        }
-        // Match the reference CLI: `q` quits only when the prompt is empty.
-        KeyCode::Char('q') if app.input.is_empty() && app.pending.is_none() => {
-            app.request_quit();
-        }
-        KeyCode::Tab if app.pending.is_none() => app.next_agent(),
-        KeyCode::BackTab if app.pending.is_none() => app.prev_agent(),
-        KeyCode::Up if app.pending.is_none() => app.recall_older(),
-        KeyCode::Down if app.pending.is_none() => app.recall_newer(),
-        KeyCode::F(2) if app.pending.is_none() => app.next_theme(),
-        KeyCode::Left => app.cursor_left(),
-        KeyCode::Right => app.cursor_right(),
-        KeyCode::Home => app.cursor_home(),
-        KeyCode::End => app.cursor_end(),
-        KeyCode::Backspace if app.mention.is_some() => {
+        UiCommand::MentionUp => app.mention_up(),
+        UiCommand::MentionDown => app.mention_down(),
+        UiCommand::MentionDismiss => app.mention_dismiss(),
+        UiCommand::MentionBackspace => {
             let query_empty = app.mention_query().is_empty();
             app.backspace();
             if query_empty {
@@ -281,24 +216,75 @@ async fn handle_terminal_event(
                 app.mention_update(q);
             }
         }
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete_forward(),
-        KeyCode::Char('/') if app.input.is_empty() && app.pending.is_none() => {
-            app.toggle_palette();
-        }
-        KeyCode::Char('@')
-            if app.pending.is_none() && app.palette.is_none() && app.mention.is_none() =>
-        {
-            app.push_char('@');
-            app.open_mention();
-        }
-        KeyCode::Char(c) if app.mention.is_some() => {
+        UiCommand::MentionChar(c) => {
             app.push_char(c);
             let q = app.mention_query();
             app.mention_update(q);
         }
-        KeyCode::Char(c) => app.push_char(c),
-        _ => {}
+        UiCommand::Submit => {
+            if let Some(content) = app.submit() {
+                // `!`-prefixed input runs a LOCAL shell command (not through the LLM).
+                if let Some(cmd) = content.strip_prefix('!').map(str::trim) {
+                    if !cmd.is_empty() {
+                        app.record_shell(cmd.to_string());
+                        let out = tokio::task::spawn_blocking({
+                            let cmd = cmd.to_string();
+                            move || run_local_shell(&cmd)
+                        })
+                        .await
+                        .unwrap_or_else(|_| ("(shell task failed)".to_string(), false));
+                        app.record_shell_output(out.0, out.1);
+                    }
+                    return Ok(());
+                }
+                let agent = app.current_agent().to_string();
+                app.begin_turn(content.clone());
+                let sid = session_id.lock().unwrap().clone();
+                sink.send(build_send_message(sid, content, &agent))
+                    .await
+                    .context("chat stream closed")?;
+            }
+        }
+        UiCommand::ResolvePermission(allow) => {
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_permission(allow, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        UiCommand::ResolveQuestion { answer } => {
+            app.input.clear();
+            app.cursor = 0;
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_question(answer, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        UiCommand::ResolveDiffReviewAccept => {
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_diff_review("accept", None, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        UiCommand::ResolveDiffReviewReject => {
+            let sid = session_id.lock().unwrap().clone();
+            if let Some(msg) = app.resolve_diff_review("reject", None, sid) {
+                sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        UiCommand::EditDiffReview => {
+            if let Some(content) = edit_diff_review_content(app) {
+                let sid = session_id.lock().unwrap().clone();
+                if let Some(msg) = app.resolve_diff_review("edit", Some(content), sid) {
+                    sink.send(msg).await.context("chat stream closed")?;
+                }
+            }
+        }
+        UiCommand::Quit => app.request_quit(),
+        UiCommand::Resize => {
+            // Snap to the bottom on resize (a safe default); Phase 3 remeasures + clamps precisely.
+            app.ui.transcript.scroll_to_end(0, 0);
+            app.ui.sidebar_offset = 0;
+        }
     }
 
     Ok(())
@@ -339,7 +325,8 @@ fn run_local_shell(command: &str) -> (String, bool) {
 }
 
 /// Open the pending diff-review's proposed content in `$EDITOR` (fallback `vi`), returning the
-/// hand-edited content. Suspends raw mode around the editor so it can take over the terminal.
+/// hand-edited content. Suspends raw mode + mouse capture around the editor so it can take over the
+/// terminal cleanly, then re-enters both.
 fn edit_diff_review_content(app: &App) -> Option<String> {
     let Some(Prompt::DiffReview { after, .. }) = &app.pending else {
         return None;
@@ -348,9 +335,11 @@ fn edit_diff_review_content(app: &App) -> Option<String> {
     let path = std::env::temp_dir().join(format!("astra-edit-{}.txt", std::process::id()));
     std::fs::write(&path, after.as_bytes()).ok()?;
 
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     let _ = std::process::Command::new(&editor).arg(&path).status().ok();
     ratatui::try_init().ok();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 
     let edited = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
@@ -423,6 +412,17 @@ async fn load_agents(channel: &Channel) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    async fn apply(app: &mut App, event: Event, sink: &mpsc::Sender<ChatClientMsg>) {
+        let sid = Arc::new(Mutex::new(Some("s-9".to_string())));
+        let command = route(&event, app);
+        apply_command(app, command, sink, &sid).await.unwrap();
+    }
 
     #[test]
     fn build_send_message_carries_content_and_agent() {
@@ -447,17 +447,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            handle_terminal_event(
-                &mut app,
-                Event::Key(crossterm::event::KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )),
-                &sink,
-                &Arc::new(Mutex::new(Some("s-9".to_string()))),
-            )
-            .await
-            .unwrap();
+            apply(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &sink).await
         });
 
         assert!(app.running);
@@ -479,33 +469,18 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            handle_terminal_event(
+            apply(
                 &mut app,
-                Event::Key(crossterm::event::KeyEvent::new(
-                    KeyCode::Char('c'),
-                    KeyModifiers::CONTROL,
-                )),
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 &sink,
-                &Arc::new(Mutex::new(None)),
             )
             .await
-            .unwrap();
         });
         assert!(app.quit);
         app.quit = false;
 
         rt.block_on(async {
-            handle_terminal_event(
-                &mut app,
-                Event::Key(crossterm::event::KeyEvent::new(
-                    KeyCode::Char('q'),
-                    KeyModifiers::NONE,
-                )),
-                &sink,
-                &Arc::new(Mutex::new(None)),
-            )
-            .await
-            .unwrap();
+            apply(&mut app, key(KeyCode::Char('q'), KeyModifiers::NONE), &sink).await
         });
         assert!(app.quit);
     }
@@ -518,17 +493,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            handle_terminal_event(
-                &mut app,
-                Event::Key(crossterm::event::KeyEvent::new(
-                    KeyCode::Char('q'),
-                    KeyModifiers::NONE,
-                )),
-                &sink,
-                &Arc::new(Mutex::new(None)),
-            )
-            .await
-            .unwrap();
+            apply(&mut app, key(KeyCode::Char('q'), KeyModifiers::NONE), &sink).await
         });
         assert!(!app.quit);
         // `q` does not quit when the prompt is non-empty; it is typed normally.
