@@ -51,6 +51,10 @@ async fn run_inner(
 ) -> anyhow::Result<()> {
     let agents = load_agents(&channel).await;
     let mut app = App::new(agents);
+    // Pre-scan the workspace for @-file mentions (bounded; run once at startup).
+    if let Ok(cwd) = std::env::current_dir() {
+        app.set_files(scan_workspace_files(&cwd, 300));
+    }
     // Fresh session: `None` until the daemon's `SessionStarted` event returns the real id.
     let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -151,6 +155,20 @@ async fn handle_terminal_event(
         }
         KeyCode::Up if app.palette.is_some() => app.palette_up(),
         KeyCode::Down if app.palette.is_some() => app.palette_down(),
+        // @-mention popup.
+        KeyCode::Esc if app.mention.is_some() => app.mention_dismiss(),
+        KeyCode::Enter if app.mention.is_some() => {
+            if let Some(item) = app.mention_selected() {
+                app.mention_insert(&item);
+            }
+        }
+        KeyCode::Tab if app.mention.is_some() => {
+            if let Some(item) = app.mention_selected() {
+                app.mention_insert(&item);
+            }
+        }
+        KeyCode::Up if app.mention.is_some() => app.mention_up(),
+        KeyCode::Down if app.mention.is_some() => app.mention_down(),
         KeyCode::Esc => {
             let sid = session_id.lock().unwrap().clone();
             match app.pending.clone() {
@@ -234,10 +252,31 @@ async fn handle_terminal_event(
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),
         KeyCode::End => app.cursor_end(),
+        KeyCode::Backspace if app.mention.is_some() => {
+            let query_empty = app.mention_query().is_empty();
+            app.backspace();
+            if query_empty {
+                app.mention_dismiss();
+            } else {
+                let q = app.mention_query();
+                app.mention_update(q);
+            }
+        }
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete_forward(),
         KeyCode::Char('/') if app.input.is_empty() && app.pending.is_none() => {
             app.toggle_palette();
+        }
+        KeyCode::Char('@')
+            if app.pending.is_none() && app.palette.is_none() && app.mention.is_none() =>
+        {
+            app.push_char('@');
+            app.open_mention();
+        }
+        KeyCode::Char(c) if app.mention.is_some() => {
+            app.push_char(c);
+            let q = app.mention_query();
+            app.mention_update(q);
         }
         KeyCode::Char(c) => app.push_char(c),
         _ => {}
@@ -278,6 +317,41 @@ fn run_local_shell(command: &str) -> (String, bool) {
         }
         Err(e) => (format!("failed to run: {e}"), false),
     }
+}
+
+/// A bounded workspace file scan for @-file mentions: relative file paths, skipping noise dirs
+/// and hidden files, capped at `max` entries.
+fn scan_workspace_files(cwd: &std::path::Path, max: usize) -> Vec<String> {
+    const SKIP: &[&str] = &["target", "node_modules", ".git", "dist", "out", ".astra"];
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![cwd.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= max {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                if !SKIP.contains(&name.as_str()) {
+                    stack.push(path);
+                }
+            } else if let Ok(rel) = path.strip_prefix(cwd) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// List the agents available to drive a session. Falls back to the built-in set

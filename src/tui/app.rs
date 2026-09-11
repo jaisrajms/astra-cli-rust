@@ -74,6 +74,32 @@ pub enum Prompt {
     },
 }
 
+/// An @-mention candidate: an agent or a workspace file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MentionItem {
+    Agent(String),
+    File(String),
+}
+
+impl MentionItem {
+    pub fn label(&self) -> &str {
+        match self {
+            MentionItem::Agent(n) => n,
+            MentionItem::File(p) => p,
+        }
+    }
+}
+
+/// The open @-mention popup.
+#[derive(Debug, Clone)]
+pub struct Mention {
+    /// Character index in `input` where the `@` that opened this mention sits.
+    pub trigger: usize,
+    pub query: String,
+    pub items: Vec<MentionItem>,
+    pub selection: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     /// Agent names offered by the picker (already de-duplicated/sorted).
@@ -103,6 +129,10 @@ pub struct App {
     pub theme_index: usize,
     /// Open command-palette selection (None = closed).
     pub palette: Option<usize>,
+    /// The open @-mention popup, if any.
+    pub mention: Option<Mention>,
+    /// Cached workspace file list (relative paths) for @-file mentions.
+    pub files: Vec<String>,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
     /// Monotonic frame counter driving the spinner animation.
@@ -134,6 +164,8 @@ impl App {
             last_usage: None,
             theme_index: 0,
             palette: None,
+            mention: None,
+            files: Vec::new(),
             quit: false,
             tick: 0,
         }
@@ -328,6 +360,107 @@ impl App {
     /// The selected palette command label, or `None` when the palette is closed.
     pub fn palette_selected(&self) -> Option<&'static str> {
         self.palette.map(|i| PALETTE_COMMANDS[i])
+    }
+
+    // --- @-mentions ---
+
+    /// Set the cached workspace file list (for @-file mentions).
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files;
+    }
+
+    /// Open the @-mention popup; `trigger` is the index of the `@` in `input` (the `@` was just
+    /// pushed, so it is `input.len() - 1`).
+    pub fn open_mention(&mut self) {
+        if self.mention.is_some() {
+            return;
+        }
+        let trigger = self.input.chars().count().saturating_sub(1);
+        let items = self.mention_candidates("");
+        self.mention = Some(Mention {
+            trigger,
+            query: String::new(),
+            items,
+            selection: 0,
+        });
+    }
+
+    /// Re-filter the mention popup for the query (the text after the trigger `@`).
+    pub fn mention_update(&mut self, query: String) {
+        let items = self.mention_candidates(&query);
+        if let Some(m) = &mut self.mention {
+            m.query = query;
+            m.selection = 0;
+            m.items = items;
+        }
+    }
+
+    fn mention_candidates(&self, query: &str) -> Vec<MentionItem> {
+        let q = query.to_lowercase();
+        let mut items: Vec<MentionItem> = self
+            .agents
+            .iter()
+            .filter(|a| a.to_lowercase().contains(&q))
+            .map(|a| MentionItem::Agent(a.clone()))
+            .collect();
+        items.extend(
+            self.files
+                .iter()
+                .filter(|f| f.to_lowercase().contains(&q))
+                .map(|f| MentionItem::File(f.clone())),
+        );
+        items.truncate(60);
+        items
+    }
+
+    pub fn mention_up(&mut self) {
+        if let Some(m) = &mut self.mention {
+            if !m.items.is_empty() {
+                m.selection = (m.selection + m.items.len() - 1) % m.items.len();
+            }
+        }
+    }
+
+    pub fn mention_down(&mut self) {
+        if let Some(m) = &mut self.mention {
+            if !m.items.is_empty() {
+                m.selection = (m.selection + 1) % m.items.len();
+            }
+        }
+    }
+
+    pub fn mention_selected(&self) -> Option<MentionItem> {
+        self.mention
+            .as_ref()
+            .and_then(|m| m.items.get(m.selection).cloned())
+    }
+
+    /// Replace the `@query` span (from the trigger `@` to the end) with the selected item's label.
+    pub fn mention_insert(&mut self, item: &MentionItem) {
+        let Some(m) = &self.mention else {
+            return;
+        };
+        let chars: Vec<char> = self.input.chars().collect();
+        let trigger = m.trigger.min(chars.len());
+        let label = item.label();
+        let mut new_input: String = chars[..trigger].iter().collect();
+        new_input.push_str(label);
+        new_input.push(' ');
+        self.input = new_input;
+        self.cursor = self.input.chars().count();
+        self.mention = None;
+    }
+
+    /// The query text after the trigger `@`, or empty when no mention is open.
+    pub fn mention_query(&self) -> String {
+        match &self.mention {
+            Some(m) => self.input.chars().skip(m.trigger + 1).collect(),
+            None => String::new(),
+        }
+    }
+
+    pub fn mention_dismiss(&mut self) {
+        self.mention = None;
     }
 
     /// Resolve the pending permission prompt: `allow` true → allow, false → deny. Returns the
@@ -847,5 +980,35 @@ mod tests {
         assert_eq!(app.input, "second");
         app.recall_newer(); // past newest -> fresh buffer
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn mention_filters_agents_and_files_and_inserts() {
+        let mut app = App::new(vec!["build".into(), "plan".into()]);
+        app.set_files(vec!["src/main.rs".into(), "src/lib.rs".into()]);
+
+        app.push_char('@');
+        app.open_mention();
+        assert!(app.mention.is_some());
+        let items = &app.mention.as_ref().unwrap().items;
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, MentionItem::Agent(a) if a == "build")));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, MentionItem::File(p) if p == "src/main.rs")));
+
+        // Typing narrows to `m` matches only.
+        app.push_char('m');
+        app.mention_update(app.mention_query());
+        let items = &app.mention.as_ref().unwrap().items;
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.label().contains('m')));
+
+        // Insert the selected item; the `@` is consumed.
+        let sel = app.mention_selected().unwrap();
+        app.mention_insert(&sel);
+        assert!(app.mention.is_none());
+        assert!(!app.input.contains('@'), "input: {}", app.input);
     }
 }

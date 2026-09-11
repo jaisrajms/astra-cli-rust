@@ -61,6 +61,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.palette.is_some() {
         render_palette(frame, app, area, theme);
     }
+    if app.mention.is_some() {
+        render_mention(frame, app, area, theme);
+    }
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -516,6 +519,53 @@ fn render_palette(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .title(" commands ")
         .border_style(Style::default().fg(theme.accent));
     frame.render_widget(Paragraph::new(items).block(block), palette_area);
+}
+
+fn render_mention(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    use super::app::MentionItem;
+
+    let Some(m) = &app.mention else {
+        return;
+    };
+    if m.items.is_empty() {
+        return;
+    }
+
+    let max_show = 8usize;
+    let visible = &m.items[..m.items.len().min(max_show)];
+    let width = 44_u16;
+    let height = visible.len() as u16 + 2;
+    let x = area.x + 2;
+    let y = area.y + area.height.saturating_sub(height + 5);
+    let popup = Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+
+    let items: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let (kind, label) = match item {
+                MentionItem::Agent(n) => ("@", n.as_str()),
+                MentionItem::File(p) => ("#", p.as_str()),
+            };
+            let line = format!("{kind} {label}");
+            if i == m.selection {
+                Line::from(Span::styled(line, Style::default().fg(theme.accent).bold()))
+            } else {
+                Line::from(Span::raw(line))
+            }
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" mentions ")
+        .border_style(Style::default().fg(theme.accent));
+    frame.render_widget(Paragraph::new(items).block(block), popup);
 }
 
 #[cfg(test)]
