@@ -19,6 +19,19 @@ use crate::tool::{summarize_input, tool_icon};
 /// input, statusline.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let theme = *theme_at(app.theme_index);
+
+    // A right-hand sidebar when the terminal is wide enough (the reference CLI shows it above
+    // ~120 cols; we use a lower threshold for smaller terminals).
+    let (main, sidebar) = if area.width >= 100 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(22)])
+            .split(area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (area, None)
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -30,9 +43,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Length(1),
         ])
-        .split(area);
-
-    let theme = *theme_at(app.theme_index);
+        .split(main);
 
     render_title(frame, app, chunks[0], theme);
     render_history(frame, app, chunks[1], theme);
@@ -43,6 +54,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         None => render_input(frame, app, chunks[4], theme),
     }
     render_status(frame, app, chunks[5], theme);
+
+    if let Some(sidebar) = sidebar {
+        render_sidebar(frame, app, sidebar, theme);
+    }
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -414,6 +429,54 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
             inner.x + (prefix.chars().count() + app.cursor).min(inner.width as usize) as u16;
         frame.set_cursor_position((cursor_x, inner.y + 1));
     }
+}
+
+fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    let title = app.title.clone().unwrap_or_else(|| "Astra".to_string());
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().fg(theme.accent).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("agent  ", Style::default().fg(theme.dim)),
+            Span::styled(app.current_agent(), Style::default().fg(theme.accent)),
+        ]),
+        Line::from(vec![
+            Span::styled("theme  ", Style::default().fg(theme.dim)),
+            Span::raw(theme.name),
+        ]),
+    ];
+    if let Some((input, output, cost)) = app.last_usage {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "usage",
+            Style::default().fg(theme.dim),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  ↑ ", Style::default().fg(theme.dim)),
+            Span::raw(input.to_string()),
+            Span::styled("  ↓ ", Style::default().fg(theme.dim)),
+            Span::raw(output.to_string()),
+        ]));
+        if let Some(cost) = cost {
+            lines.push(Line::from(vec![
+                Span::styled("  $ ", Style::default().fg(theme.dim)),
+                Span::raw(format!("{cost:.4}")),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Astra",
+        Style::default().fg(theme.dim),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::LEFT).title(" session "))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 #[cfg(test)]
