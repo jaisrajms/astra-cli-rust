@@ -340,6 +340,8 @@ pub struct App {
     pub files: Vec<String>,
     /// Set once the user requests a clean exit (Ctrl-C / `q` / Esc).
     pub quit: bool,
+    /// Esc was pressed once at the prompt (a second Esc quits).
+    pub esc_armed: bool,
     /// Monotonic frame counter driving the spinner animation.
     pub tick: u64,
     /// Presentation-only state (focus, scroll, expansion, sidebar, model/context/mcp).
@@ -375,6 +377,7 @@ impl App {
             mention: None,
             files: Vec::new(),
             quit: false,
+            esc_armed: false,
             tick: 0,
             ui: UiState::default(),
         }

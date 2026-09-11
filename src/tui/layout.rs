@@ -9,7 +9,6 @@ pub const SIDEBAR_THRESHOLD: u16 = 120;
 /// the caller-supplied prompt rows.
 const TITLE_ROWS: u16 = 3;
 const TOOL_STATUS_ROWS: u16 = 1;
-const AGENT_TABS_ROWS: u16 = 1;
 const FOOTER_ROWS: u16 = 1;
 
 /// A ratatui-free rectangle.
@@ -70,11 +69,10 @@ impl Layout {
             None
         };
 
-        // Every fixed row other than the transcript: title + tool status + agent tabs + prompt +
-        // footer. The transcript is the flexible remainder and shrinks first on a tiny terminal.
+        // Every fixed row other than the transcript: title + tool status + prompt + footer. The
+        // transcript is the flexible remainder and shrinks first on a tiny terminal.
         let fixed_rows = TITLE_ROWS
             .saturating_add(TOOL_STATUS_ROWS)
-            .saturating_add(AGENT_TABS_ROWS)
             .saturating_add(prompt_rows)
             .saturating_add(FOOTER_ROWS);
         let transcript_height = height.saturating_sub(fixed_rows);
@@ -86,8 +84,7 @@ impl Layout {
             height: transcript_height,
         };
 
-        let prompt_y =
-            transcript_height.saturating_add(TITLE_ROWS + TOOL_STATUS_ROWS + AGENT_TABS_ROWS);
+        let prompt_y = transcript_height.saturating_add(TITLE_ROWS + TOOL_STATUS_ROWS);
         let prompt = Rect {
             x: 0,
             y: prompt_y,
@@ -158,23 +155,23 @@ mod tests {
             taller.transcript.height,
             base.transcript.height.saturating_sub(5)
         );
-        assert_eq!(taller.transcript.height, 40 - 3 - 1 - 1 - 8 - 1);
+        assert_eq!(taller.transcript.height, 40 - 3 - 1 - 8 - 1);
         assert_eq!(base.prompt.height, 3);
         assert_eq!(taller.prompt.height, 8);
-        // the prompt starts right after title + transcript + tool status + agent tabs.
-        assert_eq!(base.prompt.y, 3 + base.transcript.height + 1 + 1);
+        // the prompt starts right after title + transcript + tool status.
+        assert_eq!(base.prompt.y, 3 + base.transcript.height + 1);
         assert_eq!(base.footer.y, base.prompt.y + 3);
         assert_eq!(base.footer.height, 1);
     }
 
     #[test]
     fn hit_test_maps_cells_to_surfaces() {
-        // width 120, height 40, prompt_rows 3: sidebar x 78..120, transcript y 3..34, prompt y 36..39.
+        // width 120, height 40, prompt_rows 3: sidebar x 78..120, transcript y 3..35, prompt y 36..39.
         let layout = Layout::compute(120, 40, 3);
         assert_eq!(layout.hit_test(100, 10), Surface::Sidebar);
         assert_eq!(layout.hit_test(10, 10), Surface::Transcript);
         assert_eq!(layout.hit_test(10, 37), Surface::Prompt);
-        // title (y 0..3), tool status, agent tabs, and footer (y 39) map to nothing.
+        // title (y 0..3), tool status, and footer (y 39) map to nothing.
         assert_eq!(layout.hit_test(10, 0), Surface::None);
         assert_eq!(layout.hit_test(10, 39), Surface::None);
     }
@@ -183,7 +180,7 @@ mod tests {
     fn tiny_terminal_does_not_panic() {
         let layout = Layout::compute(20, 3, 12);
         assert_eq!(layout.sidebar, None);
-        // fixed rows (3 + 1 + 1 + 12 + 1 = 18) exceed height 3, so the transcript collapses to 0.
+        // fixed rows (3 + 1 + 12 + 1 = 17) exceed height 3, so the transcript collapses to 0.
         assert_eq!(layout.transcript.height, 0);
         assert_eq!(layout.prompt.height, 12);
         assert_eq!(layout.footer.height, 1);

@@ -14,7 +14,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 use crate::endpoint::with_workspace;
-use crate::tool::{summarize_input, tool_icon};
+use crate::tool::{tool_icon, tool_label};
 
 use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::session_service_client::SessionServiceClient;
@@ -296,8 +296,8 @@ impl<W: Write, E: Write> Renderer<W, E> {
                     );
                 } else {
                     self.header();
-                    let args = summarize_input(&t.input);
-                    let _ = writeln!(self.err, "{} {}{}", tool_icon(&t.name), t.name, args);
+                    let label = tool_label(&t.name, &t.input);
+                    let _ = writeln!(self.err, "{} {label}", tool_icon(&t.name));
                 }
             }
             Some(agent_event::Kind::ToolResult(t)) => {

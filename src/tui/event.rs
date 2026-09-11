@@ -72,6 +72,8 @@ pub enum UiCommand {
     EditDiffReview,
     // Global.
     Quit,
+    /// Esc pressed at the prompt with nothing to dismiss — arm/confirm the quit (two Esc quits).
+    EscQuit,
     /// The terminal was resized (clamp scroll offsets).
     Resize,
 }
@@ -127,7 +129,7 @@ fn route_key(key: &KeyEvent, app: &App) -> UiCommand {
                 answer: String::new(),
             },
             Some(Prompt::DiffReview { .. }) => UiCommand::ResolveDiffReviewReject,
-            None => UiCommand::Quit,
+            None => UiCommand::EscQuit,
         },
         KeyCode::Enter => match &app.pending {
             Some(Prompt::Permission { .. }) => UiCommand::ResolvePermission(true),
@@ -146,8 +148,6 @@ fn route_key(key: &KeyEvent, app: &App) -> UiCommand {
         KeyCode::Char('e') if matches!(app.pending, Some(Prompt::DiffReview { .. })) => {
             UiCommand::EditDiffReview
         }
-        // Match the reference CLI: `q` quits only when the prompt is empty.
-        KeyCode::Char('q') if app.input.is_empty() && app.pending.is_none() => UiCommand::Quit,
         KeyCode::Tab if app.pending.is_none() => UiCommand::NextAgent,
         KeyCode::BackTab if app.pending.is_none() => UiCommand::PrevAgent,
         KeyCode::Up if app.pending.is_none() => UiCommand::RecallOlder,
@@ -352,9 +352,15 @@ mod tests {
             route_key(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &app),
             UiCommand::Quit
         );
+        // Esc at the prompt arms the quit (two Esc quits), not quit immediately.
+        assert_eq!(
+            route_key(&key(KeyCode::Esc, KeyModifiers::NONE), &app),
+            UiCommand::EscQuit
+        );
+        // `q` is an ordinary character.
         assert_eq!(
             route_key(&key(KeyCode::Char('q'), KeyModifiers::NONE), &app),
-            UiCommand::Quit
+            UiCommand::Insert('q')
         );
         assert_eq!(
             route_key(&key(KeyCode::Char('h'), KeyModifiers::NONE), &app),

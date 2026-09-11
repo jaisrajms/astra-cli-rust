@@ -5,9 +5,9 @@
 //! it never re-derives scroll geometry and the paint pass agrees with the scroll math.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::{App, Prompt, SidebarMode, ToolStatus};
@@ -46,12 +46,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         main_width,
         1,
     );
-    let agent_tabs = rr(
-        0,
-        layout.transcript.y + layout.transcript.height + 1,
-        main_width,
-        1,
-    );
     let prompt = rr(
         layout.prompt.x,
         layout.prompt.y,
@@ -68,7 +62,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_title(frame, app, title, theme);
     render_history(frame, app, transcript, theme);
     render_tool_status(frame, app, tool_status, theme);
-    render_agent_tabs(frame, app, agent_tabs, theme);
     match &app.pending {
         Some(_) => render_prompt(frame, app, prompt, theme),
         None => render_input(frame, app, prompt, theme),
@@ -177,21 +170,6 @@ fn render_tool_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_agent_tabs(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
-    let titles: Vec<String> = app.agents.iter().map(|a| format!(" {a} ")).collect();
-    let tabs = Tabs::new(titles)
-        .select(app.agent_index)
-        .style(Style::default().fg(theme.dim))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider("│");
-    frame.render_widget(tabs, area);
-}
-
 fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -249,8 +227,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
     let hint = if app.running {
         "esc interrupt"
+    } else if app.esc_armed {
+        "esc again to quit"
     } else {
-        "ctrl+c / q exit"
+        "ctrl+c exit"
     };
     spans.push(Span::styled(
         format!("    {hint}"),

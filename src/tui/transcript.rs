@@ -185,12 +185,13 @@ fn tool_lines(
         ])];
     };
 
-    let color = if out.ok { theme.dim } else { theme.err };
+    // Decorate the tool line by status: green icon + label on success, red on failure.
+    let status = if out.ok { theme.ok } else { theme.err };
     let mut lines = vec![Line::from(vec![
         Span::raw("   "),
-        Span::styled(icon, Style::default().fg(color)),
+        Span::styled(icon, Style::default().fg(status).bold()),
         Span::raw(" "),
-        Span::styled(label, Style::default().fg(color)),
+        Span::styled(label, Style::default().fg(status)),
     ])];
 
     if is_shell {
@@ -214,7 +215,7 @@ fn tool_lines(
         for out_line in shown.lines() {
             lines.push(Line::from(Span::styled(
                 format!("     {out_line}"),
-                Style::default().fg(color),
+                Style::default().fg(status),
             )));
         }
         if expanded {

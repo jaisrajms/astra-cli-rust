@@ -157,6 +157,11 @@ async fn apply_command(
     sink: &mpsc::Sender<ChatClientMsg>,
     session_id: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
+    // Any non-Esc action clears a pending quit-arm.
+    if !matches!(command, UiCommand::EscQuit) {
+        app.esc_armed = false;
+    }
+
     match command {
         UiCommand::Noop => {}
         UiCommand::ScrollTranscript(delta) => {
@@ -299,6 +304,13 @@ async fn apply_command(
             }
         }
         UiCommand::Quit => app.request_quit(),
+        UiCommand::EscQuit => {
+            if app.esc_armed {
+                app.request_quit();
+            } else {
+                app.esc_armed = true;
+            }
+        }
         UiCommand::Resize => {
             // Snap to the bottom on resize (a safe default); Phase 3 remeasures + clamps precisely.
             app.ui.transcript.scroll_to_end(0, 0);
@@ -485,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_and_empty_q_quit() {
+    fn ctrl_c_quits_and_esc_requires_two_presses() {
         let (sink, _rx) = mpsc::channel::<ChatClientMsg>(4);
         let mut app = App::new(vec!["build".into()]);
 
@@ -501,14 +513,18 @@ mod tests {
         assert!(app.quit);
         app.quit = false;
 
-        rt.block_on(async {
-            apply(&mut app, key(KeyCode::Char('q'), KeyModifiers::NONE), &sink).await
-        });
+        // A single Esc arms the quit; it does not quit.
+        rt.block_on(async { apply(&mut app, key(KeyCode::Esc, KeyModifiers::NONE), &sink).await });
+        assert!(!app.quit);
+        assert!(app.esc_armed);
+
+        // A second Esc quits.
+        rt.block_on(async { apply(&mut app, key(KeyCode::Esc, KeyModifiers::NONE), &sink).await });
         assert!(app.quit);
     }
 
     #[test]
-    fn q_with_nonempty_input_does_not_quit() {
+    fn q_is_just_a_regular_character() {
         let (sink, _rx) = mpsc::channel::<ChatClientMsg>(4);
         let mut app = App::new(vec!["build".into()]);
         app.push_char('q');
@@ -518,7 +534,7 @@ mod tests {
             apply(&mut app, key(KeyCode::Char('q'), KeyModifiers::NONE), &sink).await
         });
         assert!(!app.quit);
-        // `q` does not quit when the prompt is non-empty; it is typed normally.
+        // `q` is typed normally, not a quit key.
         assert_eq!(app.input, "qq");
     }
 }
