@@ -79,6 +79,10 @@ pub struct App {
     /// The in-progress chat input buffer.
     pub input: String,
     pub cursor: usize,
+    /// Prior submitted prompts (oldest first) for up/down recall.
+    pub history: Vec<String>,
+    /// Position into `history` when recalling (None = editing a fresh prompt).
+    pub recall_index: Option<usize>,
     /// Completed history lines, in order.
     pub items: Vec<Item>,
     /// In-flight assistant text (streamed incrementally).
@@ -111,6 +115,8 @@ impl App {
             agent_index,
             input: String::new(),
             cursor: 0,
+            history: Vec::new(),
+            recall_index: None,
             items: Vec::new(),
             streaming: String::new(),
             tool: ToolStatus::Idle,
@@ -203,11 +209,46 @@ impl App {
 
     /// Record a user message + begin a new turn.
     pub fn begin_turn(&mut self, content: String) {
-        self.items.push(Item::User(content));
+        self.items.push(Item::User(content.clone()));
+        self.history.push(content);
+        self.recall_index = None;
         self.streaming.clear();
         self.tool = ToolStatus::Idle;
         self.error = None;
         self.running = true;
+    }
+
+    // --- prompt history recall ---
+
+    /// Recall the previous prompt (Up), or the first previous one if not yet recalling.
+    pub fn recall_older(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        self.recall_index = Some(match self.recall_index {
+            None => self.history.len() - 1,
+            Some(i) if i > 0 => i - 1,
+            Some(i) => i,
+        });
+        if let Some(i) = self.recall_index {
+            self.input = self.history[i].clone();
+            self.cursor = self.input.chars().count();
+        }
+    }
+
+    /// Recall the next prompt (Down), clearing to a fresh buffer past the newest.
+    pub fn recall_newer(&mut self) {
+        let Some(i) = self.recall_index else {
+            return;
+        };
+        if i + 1 < self.history.len() {
+            self.recall_index = Some(i + 1);
+            self.input = self.history[i + 1].clone();
+        } else {
+            self.recall_index = None;
+            self.input.clear();
+        }
+        self.cursor = self.input.chars().count();
     }
 
     // --- agent picker ---
@@ -728,5 +769,24 @@ mod tests {
             Some(chat_client_msg::Payload::ResolveAskUser(r)) if r.answer == "B"
         ));
         assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn prompt_history_recall_navigates_prior_prompts() {
+        let mut app = App::new(vec![]);
+        app.begin_turn("first".into());
+        app.begin_turn("second".into());
+
+        app.recall_older();
+        assert_eq!(app.input, "second");
+        app.recall_older();
+        assert_eq!(app.input, "first");
+        app.recall_older(); // stays at the oldest
+        assert_eq!(app.input, "first");
+
+        app.recall_newer();
+        assert_eq!(app.input, "second");
+        app.recall_newer(); // past newest -> fresh buffer
+        assert_eq!(app.input, "");
     }
 }

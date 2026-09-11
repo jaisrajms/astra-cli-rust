@@ -191,6 +191,8 @@ async fn handle_terminal_event(
         }
         KeyCode::Tab if app.pending.is_none() => app.next_agent(),
         KeyCode::BackTab if app.pending.is_none() => app.prev_agent(),
+        KeyCode::Up if app.pending.is_none() => app.recall_older(),
+        KeyCode::Down if app.pending.is_none() => app.recall_newer(),
         KeyCode::Left => app.cursor_left(),
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),
