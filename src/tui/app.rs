@@ -16,7 +16,7 @@
 
 use astra_proto::astra::engine::v1::{
     agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent, ResolveAskUser,
-    ResolveToolPermission, SessionId,
+    ResolveDiffReview, ResolveToolPermission, SessionId,
 };
 
 /// Braille spinner frames, indexed by [`App::tick`].
@@ -36,6 +36,14 @@ pub enum ToolStatus {
     Done { name: String, ok: bool },
 }
 
+/// The finished state of a tool call (reference CLI: tool part `state.output`/`state.error`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutcome {
+    pub ok: bool,
+    pub summary: String,
+    pub output: String,
+}
+
 /// One rendered history line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
@@ -44,17 +52,20 @@ pub enum Item {
     ToolCall {
         name: String,
         input: String,
-    },
-    ToolResult {
-        name: String,
-        summary: String,
-        ok: bool,
-        output: String,
+        /// `None` while in flight; `Some` once the tool has finished.
+        outcome: Option<ToolOutcome>,
     },
     Notice(String),
     Reasoning(String),
     Error(String),
     Done(String),
+}
+
+/// A single session task (reference CLI: the TodoWrite tool's `todos` array).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Todo {
+    pub content: String,
+    pub status: String,
 }
 
 /// An interactive request the daemon parked, waiting for the user's answer.
@@ -71,6 +82,15 @@ pub enum Prompt {
         id: String,
         question: String,
         options: Vec<String>,
+    },
+    /// A diff-review for a proposed Write/Edit: accept, reject, or edit the content.
+    DiffReview {
+        id: String,
+        tool_name: String,
+        file_path: String,
+        before: String,
+        after: String,
+        unified_diff: String,
     },
 }
 
@@ -125,6 +145,8 @@ pub struct App {
     pub pending: Option<Prompt>,
     /// The most recent usage sample (input, output, cost) for the footer statusline.
     pub last_usage: Option<(i64, i64, Option<f64>)>,
+    /// The current session task list, as last written by the TodoWrite tool.
+    pub todos: Vec<Todo>,
     /// Index into the built-in theme list.
     pub theme_index: usize,
     /// Open command-palette selection (None = closed).
@@ -162,6 +184,7 @@ impl App {
             title: None,
             pending: None,
             last_usage: None,
+            todos: Vec::new(),
             theme_index: 0,
             palette: None,
             mention: None,
@@ -294,20 +317,34 @@ impl App {
 
     // --- shell mode ---
 
-    /// Record a shell-mode command (`!command`) as a user line.
+    /// Record a shell-mode command (`!command`) as an in-flight Bash tool line.
     pub fn record_shell(&mut self, command: String) {
-        self.items.push(Item::User(format!("!{command}")));
+        let input = serde_json::json!({ "command": command }).to_string();
+        self.items.push(Item::ToolCall {
+            name: "Bash".to_string(),
+            input,
+            outcome: None,
+        });
     }
 
-    /// Record the output of a local shell command as a tool-result line.
+    /// Attach the output of a local shell command to the last in-flight Bash tool line.
     pub fn record_shell_output(&mut self, output: String, ok: bool) {
-        let summary = if ok { "exit 0" } else { "failed" }.to_string();
-        self.items.push(Item::ToolResult {
-            name: "shell".to_string(),
-            summary,
-            ok,
-            output,
-        });
+        if let Some(Item::ToolCall { outcome, .. }) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|i| matches!(i, Item::ToolCall { outcome: None, .. }))
+        {
+            *outcome = Some(ToolOutcome {
+                ok,
+                summary: if ok {
+                    "exit 0".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                output,
+            });
+        }
     }
 
     // --- agent picker ---
@@ -504,6 +541,30 @@ impl App {
         })
     }
 
+    /// Resolve the pending diff-review prompt with a verdict (`"accept"` | `"reject"` | `"edit"`)
+    /// and, for `"edit"`, the hand-edited content. Returns the resolver message, or `None` when no
+    /// diff-review prompt is pending.
+    pub fn resolve_diff_review(
+        &mut self,
+        verdict: &str,
+        new_content: Option<String>,
+        session_id: Option<String>,
+    ) -> Option<ChatClientMsg> {
+        let Some(Prompt::DiffReview { id, .. }) = self.pending.take() else {
+            return None;
+        };
+        Some(ChatClientMsg {
+            session_id: session_id.map(|v| SessionId { value: v }),
+            payload: Some(chat_client_msg::Payload::ResolveDiffReview(
+                ResolveDiffReview {
+                    id,
+                    verdict: verdict.to_string(),
+                    new_content,
+                },
+            )),
+        })
+    }
+
     // --- daemon events ---
 
     /// Apply one multiplexed [`ChatEvent`]: forwards agent events to
@@ -548,6 +609,17 @@ impl App {
                     options: r.options.clone(),
                 });
             }
+            Some(chat_event::Payload::DiffReviewRequest(r)) => {
+                self.flush_streaming();
+                self.pending = Some(Prompt::DiffReview {
+                    id: r.id.clone(),
+                    tool_name: r.tool_name.clone(),
+                    file_path: r.file_path.clone(),
+                    before: r.before.clone(),
+                    after: r.after.clone(),
+                    unified_diff: r.unified_diff.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -558,9 +630,14 @@ impl App {
             Some(agent_event::Kind::Text(t)) => self.streaming.push_str(&t.text),
             Some(agent_event::Kind::ToolCall(t)) => {
                 self.flush_streaming();
+                // Track the session task list whenever the TodoWrite tool rewrites it.
+                if t.name == "TodoWrite" {
+                    self.todos = parse_todos(&t.input);
+                }
                 self.items.push(Item::ToolCall {
                     name: t.name.clone(),
                     input: t.input.clone(),
+                    outcome: None,
                 });
                 self.tool = ToolStatus::Running {
                     id: t.id.clone(),
@@ -568,12 +645,20 @@ impl App {
                 };
             }
             Some(agent_event::Kind::ToolResult(t)) => {
-                self.items.push(Item::ToolResult {
-                    name: t.name.clone(),
-                    summary: t.summary.clone(),
-                    ok: !t.is_error,
-                    output: t.output.clone(),
-                });
+                // Fold the outcome into the matching in-flight tool line (the reference CLI renders
+                // a tool as a single line whose color flips once it finishes).
+                if let Some(Item::ToolCall { outcome, .. }) = self
+                    .items
+                    .iter_mut()
+                    .rev()
+                    .find(|i| matches!(i, Item::ToolCall { outcome: None, .. }))
+                {
+                    *outcome = Some(ToolOutcome {
+                        ok: !t.is_error,
+                        summary: t.summary.clone(),
+                        output: t.output.clone(),
+                    });
+                }
                 self.tool = ToolStatus::Done {
                     name: t.name.clone(),
                     ok: !t.is_error,
@@ -615,6 +700,25 @@ impl App {
             self.items.push(Item::Assistant(text));
         }
     }
+}
+
+/// Parse the TodoWrite tool's `todos` array into `[{ content, status }, ...]`.
+fn parse_todos(input: &str) -> Vec<Todo> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("todos").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            Some(Todo {
+                content: item.get("content")?.as_str()?.to_string(),
+                status: item.get("status")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -684,7 +788,9 @@ mod tests {
         // streaming text is flushed to history at the tool boundary
         assert_eq!(app.streaming, "");
         assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
-        assert!(matches!(app.items[2], Item::ToolCall { ref name, .. } if name == "bash"));
+        assert!(
+            matches!(app.items[2], Item::ToolCall { ref name, outcome: None, .. } if name == "bash")
+        );
         assert_eq!(
             app.tool,
             ToolStatus::Running {
@@ -713,14 +819,13 @@ mod tests {
         app.apply_agent_event(&done());
         assert!(!app.running);
 
-        // full history order: user, assistant(text), tool-call, tool-result
-        assert_eq!(app.items.len(), 4);
+        // full history order: user, assistant(text), tool-call (folded with its outcome)
+        assert_eq!(app.items.len(), 3);
         assert!(matches!(app.items[0], Item::User(ref s) if s == "do the thing"));
         assert!(matches!(app.items[1], Item::Assistant(ref s) if s == "hello world"));
-        assert!(matches!(app.items[2], Item::ToolCall { ref name, .. } if name == "bash"));
-        assert!(
-            matches!(app.items[3], Item::ToolResult { ref name, ok: true, .. } if name == "bash")
-        );
+        assert!(matches!(app.items[2],
+                Item::ToolCall { ref name, outcome: Some(ToolOutcome { ok: true, .. }), .. }
+                if name == "bash"));
     }
 
     #[test]
@@ -737,7 +842,10 @@ mod tests {
         );
         assert!(matches!(
             app.items.last(),
-            Some(Item::ToolResult { ok: false, .. })
+            Some(Item::ToolCall {
+                outcome: Some(ToolOutcome { ok: false, .. }),
+                ..
+            })
         ));
     }
 
@@ -961,6 +1069,48 @@ mod tests {
             Some(chat_client_msg::Payload::ResolveAskUser(r)) if r.answer == "B"
         ));
         assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn diff_review_request_parks_and_resolves_verdicts() {
+        use astra_proto::astra::engine::v1::{chat_event, ChatEvent, DiffReviewRequest};
+        let mut app = App::new(vec!["build".into()]);
+
+        let event = ChatEvent {
+            session_id: None,
+            payload: Some(chat_event::Payload::DiffReviewRequest(DiffReviewRequest {
+                id: "d1".into(),
+                tool_name: "Write".into(),
+                file_path: "../out.txt".into(),
+                before: String::new(),
+                after: "hello".into(),
+                unified_diff: "--- ../out.txt\n+++ ../out.txt\n+hello\n".into(),
+            })),
+        };
+        app.apply_chat_event(&event);
+        assert!(matches!(app.pending, Some(Prompt::DiffReview { .. })));
+
+        // Accept -> ResolveDiffReview { verdict: "accept" }.
+        let msg = app
+            .resolve_diff_review("accept", None, Some("s1".into()))
+            .expect("resolver");
+        assert!(matches!(
+            msg.payload,
+            Some(chat_client_msg::Payload::ResolveDiffReview(ref r))
+                if r.verdict == "accept" && r.new_content.is_none()
+        ));
+        assert!(app.pending.is_none());
+
+        // Edit -> ResolveDiffReview { verdict: "edit", new_content }.
+        app.apply_chat_event(&event);
+        let msg = app
+            .resolve_diff_review("edit", Some("edited".into()), Some("s1".into()))
+            .expect("resolver");
+        assert!(matches!(
+            msg.payload,
+            Some(chat_client_msg::Payload::ResolveDiffReview(ref r))
+                if r.verdict == "edit" && r.new_content.as_deref() == Some("edited")
+        ));
     }
 
     #[test]

@@ -182,6 +182,11 @@ async fn handle_terminal_event(
                         sink.send(msg).await.context("chat stream closed")?;
                     }
                 }
+                Some(Prompt::DiffReview { .. }) => {
+                    if let Some(msg) = app.resolve_diff_review("reject", None, sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
                 None => app.request_quit(),
             }
         }
@@ -198,6 +203,11 @@ async fn handle_terminal_event(
                     app.input.clear();
                     app.cursor = 0;
                     if let Some(msg) = app.resolve_question(answer, sid) {
+                        sink.send(msg).await.context("chat stream closed")?;
+                    }
+                }
+                Some(Prompt::DiffReview { .. }) => {
+                    if let Some(msg) = app.resolve_diff_review("accept", None, sid) {
                         sink.send(msg).await.context("chat stream closed")?;
                     }
                 }
@@ -237,6 +247,15 @@ async fn handle_terminal_event(
             let sid = session_id.lock().unwrap().clone();
             if let Some(msg) = app.resolve_permission(false, sid) {
                 sink.send(msg).await.context("chat stream closed")?;
+            }
+        }
+        // Edit-in-chat: open the proposed content in $EDITOR and resolve with the edited text.
+        KeyCode::Char('e') if matches!(app.pending, Some(Prompt::DiffReview { .. })) => {
+            if let Some(content) = edit_diff_review_content(app) {
+                let sid = session_id.lock().unwrap().clone();
+                if let Some(msg) = app.resolve_diff_review("edit", Some(content), sid) {
+                    sink.send(msg).await.context("chat stream closed")?;
+                }
             }
         }
         // Match the reference CLI: `q` quits only when the prompt is empty.
@@ -317,6 +336,25 @@ fn run_local_shell(command: &str) -> (String, bool) {
         }
         Err(e) => (format!("failed to run: {e}"), false),
     }
+}
+
+/// Open the pending diff-review's proposed content in `$EDITOR` (fallback `vi`), returning the
+/// hand-edited content. Suspends raw mode around the editor so it can take over the terminal.
+fn edit_diff_review_content(app: &App) -> Option<String> {
+    let Some(Prompt::DiffReview { after, .. }) = &app.pending else {
+        return None;
+    };
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let path = std::env::temp_dir().join(format!("astra-edit-{}.txt", std::process::id()));
+    std::fs::write(&path, after.as_bytes()).ok()?;
+
+    ratatui::restore();
+    let _ = std::process::Command::new(&editor).arg(&path).status().ok();
+    ratatui::try_init().ok();
+
+    let edited = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(edited)
 }
 
 /// A bounded workspace file scan for @-file mentions: relative file paths, skipping noise dirs

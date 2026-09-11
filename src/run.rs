@@ -20,7 +20,8 @@ use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
 use astra_proto::astra::engine::v1::session_service_client::SessionServiceClient;
 use astra_proto::astra::engine::v1::{
     agent_event, chat_client_msg, chat_event, AgentEvent, ChatClientMsg, ChatEvent,
-    ForkSessionRequest, ListSessionsRequest, ResolveAskUser, ResolveToolPermission, SendMessage,
+    ForkSessionRequest, ListSessionsRequest, ResolveAskUser, ResolveDiffReview,
+    ResolveToolPermission, SendMessage,
 };
 use astra_proto::{MessageId, SessionId};
 
@@ -170,6 +171,20 @@ fn auto_resolve(event: &ChatEvent, auto: bool) -> Option<ChatClientMsg> {
                 id: r.id.clone(),
                 answer: String::new(),
             })),
+        }),
+        Some(chat_event::Payload::DiffReviewRequest(r)) => Some(ChatClientMsg {
+            session_id: event.session_id.clone(),
+            payload: Some(chat_client_msg::Payload::ResolveDiffReview(
+                ResolveDiffReview {
+                    id: r.id.clone(),
+                    verdict: if auto {
+                        "accept".to_string()
+                    } else {
+                        "reject".to_string()
+                    },
+                    new_content: None,
+                },
+            )),
         }),
         _ => None,
     }

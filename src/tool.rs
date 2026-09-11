@@ -46,3 +46,100 @@ pub fn summarize_input(input: &str) -> String {
         format!(" [{}]", parts.join(", "))
     }
 }
+
+/// The reference CLI's per-tool inline label: the tool name phrased around its "primary" argument
+/// (e.g. `Read src/main.rs`, `Glob "*.rs" in src`, `$ ls`), falling back to the `[key=value, ...]`
+/// summary for tools without a dedicated label.
+pub fn tool_label(name: &str, input: &str) -> String {
+    let value = serde_json::from_str::<Value>(input).unwrap_or(Value::Null);
+
+    fn field(value: &Value, key: &str) -> Option<String> {
+        match value.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+
+    let in_dir = |dir: Option<String>| match dir {
+        Some(d) if !d.is_empty() && d != "." => Some(d),
+        _ => None,
+    };
+
+    match name {
+        "Read" => format!("Read {}", field(&value, "file_path").unwrap_or_default()),
+        "Write" => format!("Write {}", field(&value, "file_path").unwrap_or_default()),
+        "Edit" | "MultiEdit" => format!("Edit {}", field(&value, "file_path").unwrap_or_default()),
+        "NotebookEdit" => format!(
+            "Edit {}",
+            field(&value, "notebook_path").unwrap_or_default()
+        ),
+        "Bash" | "ShellBash" => field(&value, "command").unwrap_or_default(),
+        "Glob" => match in_dir(field(&value, "path")) {
+            Some(dir) => format!(
+                "Glob \"{}\" in {dir}",
+                field(&value, "pattern").unwrap_or_default()
+            ),
+            None => format!("Glob \"{}\"", field(&value, "pattern").unwrap_or_default()),
+        },
+        "Grep" => match in_dir(field(&value, "path")) {
+            Some(dir) => format!(
+                "Grep \"{}\" in {dir}",
+                field(&value, "pattern").unwrap_or_default()
+            ),
+            None => format!("Grep \"{}\"", field(&value, "pattern").unwrap_or_default()),
+        },
+        "WebFetch" => format!("WebFetch {}", field(&value, "url").unwrap_or_default()),
+        "WebSearch" => format!(
+            "WebSearch \"{}\"",
+            field(&value, "query").unwrap_or_default()
+        ),
+        "TodoWrite" => "Updating todos…".to_string(),
+        "Task" => {
+            let sub = field(&value, "subagent_type").unwrap_or_else(|| "General".to_string());
+            let desc = field(&value, "description").unwrap_or_default();
+            format!("{sub} Task — {desc}")
+        }
+        _ => format!("{name}{}", summarize_input(input)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_label_phrases_the_primary_argument() {
+        assert_eq!(
+            tool_label("Read", r#"{"file_path":"src/main.rs"}"#),
+            "Read src/main.rs"
+        );
+        assert_eq!(tool_label("Bash", r#"{"command":"ls -la"}"#), "ls -la");
+        assert_eq!(
+            tool_label("Glob", r#"{"pattern":"*.rs","path":"src"}"#),
+            "Glob \"*.rs\" in src"
+        );
+        assert_eq!(tool_label("Glob", r#"{"pattern":"*.rs"}"#), "Glob \"*.rs\"");
+        assert_eq!(tool_label("Edit", r#"{"file_path":"a.rs"}"#), "Edit a.rs");
+        assert_eq!(
+            tool_label("TodoWrite", r#"{"todos":[]}"#),
+            "Updating todos…"
+        );
+    }
+
+    #[test]
+    fn tool_label_falls_back_to_arg_summary() {
+        assert_eq!(
+            tool_label("UnknownTool", r#"{"a":1,"b":"x"}"#),
+            "UnknownTool [a=1, b=x]"
+        );
+        assert_eq!(tool_label("UnknownTool", r#"{}"#), "UnknownTool");
+    }
+
+    #[test]
+    fn tool_label_handles_malformed_input() {
+        assert_eq!(tool_label("Read", "not json"), "Read ");
+        assert_eq!(tool_label("Bash", ""), "");
+    }
+}

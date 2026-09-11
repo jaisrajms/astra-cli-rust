@@ -11,9 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use super::app::{App, Item, ToolStatus};
+use super::app::{App, Item, ToolOutcome, ToolStatus};
 use super::theme::{theme_at, Theme};
-use crate::tool::{summarize_input, tool_icon};
+use crate::tool::{tool_icon, tool_label};
 
 /// Fixed layout rows (top → bottom): title, history, tool status, agent tabs,
 /// input, statusline.
@@ -22,15 +22,21 @@ pub fn render(frame: &mut Frame, app: &App) {
     let theme = *theme_at(app.theme_index);
 
     // A right-hand sidebar when the terminal is wide enough (the reference CLI shows it above
-    // ~120 cols; we use a lower threshold for smaller terminals).
-    let (main, sidebar) = if area.width >= 100 {
+    // ~120 cols; we use a slightly lower threshold and its 42-col width).
+    let (main, sidebar) = if area.width >= 110 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(60), Constraint::Length(22)])
+            .constraints([Constraint::Min(60), Constraint::Length(42)])
             .split(area);
         (cols[0], Some(cols[1]))
     } else {
         (area, None)
+    };
+
+    // A diff-review prompt needs room to show the proposed diff; otherwise the prompt row is short.
+    let prompt_rows = match &app.pending {
+        Some(super::app::Prompt::DiffReview { .. }) => 12,
+        _ => 3,
     };
 
     let chunks = Layout::default()
@@ -40,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(prompt_rows),
             Constraint::Length(1),
         ])
         .split(main);
@@ -86,7 +92,7 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 fn render_history(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.items {
-        lines.extend(item_lines(item, theme));
+        lines.extend(item_lines(app, item, theme));
     }
     if !app.streaming.is_empty() {
         lines.extend(markdown_lines(&app.streaming, theme));
@@ -108,51 +114,18 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(paragraph, area);
 }
 
-fn item_lines(item: &Item, theme: Theme) -> Vec<Line<'static>> {
+fn item_lines(app: &App, item: &Item, theme: Theme) -> Vec<Line<'static>> {
     match item {
         Item::User(text) => vec![Line::from(vec![
             Span::styled("❯ ", Style::default().fg(theme.accent).bold()),
             Span::raw(text.clone()),
         ])],
         Item::Assistant(text) => markdown_lines(text, theme),
-        Item::ToolCall { name, input } => {
-            let args = summarize_input(input);
-            vec![Line::from(vec![
-                Span::styled(
-                    format!(" {} ", tool_icon(name)),
-                    Style::default().fg(theme.tool),
-                ),
-                Span::styled(
-                    format!("{name}{args}"),
-                    Style::default().fg(theme.tool).italic(),
-                ),
-            ])]
-        }
-        Item::ToolResult {
+        Item::ToolCall {
             name,
-            summary,
-            ok,
-            output,
-        } => {
-            let mark = if *ok { "✓" } else { "✗" };
-            let color = if *ok { theme.ok } else { theme.err };
-            let mut lines = vec![Line::from(vec![
-                Span::styled(format!("   {mark} {name}"), Style::default().fg(color)),
-                Span::styled(format!(" — {summary}"), Style::default().fg(theme.dim)),
-            ])];
-            let shown = if output.is_empty() {
-                summary.as_str()
-            } else {
-                output.as_str()
-            };
-            for out_line in shown.lines().take(6) {
-                lines.push(Line::from(Span::styled(
-                    format!("     {out_line}"),
-                    Style::default().fg(theme.dim),
-                )));
-            }
-            lines
-        }
+            input,
+            outcome,
+        } => tool_lines(app, name, input, outcome.as_ref(), theme),
         Item::Notice(text) => vec![Line::from(Span::styled(
             text.clone(),
             Style::default().fg(theme.notice),
@@ -179,6 +152,59 @@ fn item_lines(item: &Item, theme: Theme) -> Vec<Line<'static>> {
             Style::default().fg(theme.accent),
         ))],
     }
+}
+
+/// Render a tool call as a single inline row (icon + label), the way the reference CLI does: a
+/// spinner + active color while running, then the tool icon in muted/error color once finished.
+/// `Bash`/`ShellBash` additionally show their output beneath the command line.
+fn tool_lines(
+    app: &App,
+    name: &str,
+    input: &str,
+    outcome: Option<&ToolOutcome>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let label = tool_label(name, input);
+    let icon = tool_icon(name);
+    let is_shell = name == "Bash" || name == "ShellBash";
+
+    let Some(out) = outcome else {
+        // In flight: spinner glyph in the icon column.
+        return vec![Line::from(vec![
+            Span::raw("   "),
+            Span::styled(app.spinner(), Style::default().fg(theme.tool)),
+            Span::raw(" "),
+            Span::styled(label, Style::default().fg(theme.tool)),
+        ])];
+    };
+
+    let color = if out.ok { theme.dim } else { theme.err };
+    let mut lines = vec![Line::from(vec![
+        Span::raw("   "),
+        Span::styled(icon, Style::default().fg(color)),
+        Span::raw(" "),
+        Span::styled(label, Style::default().fg(color)),
+    ])];
+
+    if is_shell {
+        let shown = if out.output.is_empty() {
+            out.summary.as_str()
+        } else {
+            out.output.as_str()
+        };
+        for out_line in shown.lines().take(12) {
+            lines.push(Line::from(Span::styled(
+                format!("     {out_line}"),
+                Style::default().fg(color),
+            )));
+        }
+    } else if !out.ok && !out.summary.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("     {}", out.summary),
+            Style::default().fg(theme.err),
+        )));
+    }
+    lines
 }
 
 /// Render markdown-ish assistant text into styled lines: fenced code blocks (```), headings
@@ -266,7 +292,8 @@ fn inline_spans(text: &str, theme: Theme) -> Vec<Span<'static>> {
                         after[..end].to_string(),
                         Style::default().fg(theme.ok),
                     ));
-                    rest = &after[end + 2..];
+                    // The closing backtick is 1 byte (not 2 like `**`).
+                    rest = &after[end + 1..];
                 }
                 None => {
                     spans.push(Span::raw(after.to_string()));
@@ -405,12 +432,23 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 true,
             )
         }
+        Some(Prompt::DiffReview {
+            tool_name,
+            file_path,
+            ..
+        }) => (
+            format!("← {tool_name} {file_path}"),
+            "[Enter] accept   [e] edit   [Esc] reject".to_string(),
+            false,
+        ),
         None => return,
     };
 
+    let is_diff = matches!(app.pending, Some(Prompt::DiffReview { .. }));
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" confirm ")
+        .title(" review ")
         .border_style(Style::default().fg(theme.tool));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -419,6 +457,29 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         title,
         Style::default().fg(theme.tool).bold(),
     ))];
+
+    if is_diff {
+        // The proposed unified diff, `-` lines in error color, `+` lines in ok color.
+        if let Some(Prompt::DiffReview { unified_diff, .. }) = &app.pending {
+            for raw in unified_diff
+                .lines()
+                .take(inner.height.saturating_sub(3) as usize)
+            {
+                let color = if raw.starts_with('-') {
+                    theme.err
+                } else if raw.starts_with('+') {
+                    theme.ok
+                } else {
+                    theme.dim
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {raw}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+    }
+
     if show_input {
         let text = format!("❯ {}", app.input);
         lines.push(Line::from(Span::raw(text)));
@@ -445,39 +506,48 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
             Style::default().fg(theme.accent).bold(),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("agent  ", Style::default().fg(theme.dim)),
-            Span::styled(app.current_agent(), Style::default().fg(theme.accent)),
-        ]),
-        Line::from(vec![
-            Span::styled("theme  ", Style::default().fg(theme.dim)),
-            Span::raw(theme.name),
-        ]),
     ];
+
+    // Context (the reference CLI's sidebar-context feature): tokens + spend.
     if let Some((input, output, cost)) = app.last_usage {
-        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Context", Style::default().bold())));
+        let tokens = input + output;
         lines.push(Line::from(Span::styled(
-            "usage",
+            format!("{tokens} tokens"),
             Style::default().fg(theme.dim),
         )));
-        lines.push(Line::from(vec![
-            Span::styled("  ↑ ", Style::default().fg(theme.dim)),
-            Span::raw(input.to_string()),
-            Span::styled("  ↓ ", Style::default().fg(theme.dim)),
-            Span::raw(output.to_string()),
-        ]));
         if let Some(cost) = cost {
+            lines.push(Line::from(Span::styled(
+                format!("${cost:.4} spent"),
+                Style::default().fg(theme.dim),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // LSP (the reference CLI's sidebar-lsp feature): no servers are wired, so always disabled.
+    lines.push(Line::from(Span::styled("LSP", Style::default().bold())));
+    lines.push(Line::from(Span::styled(
+        "LSPs are disabled",
+        Style::default().fg(theme.dim),
+    )));
+
+    // Todo (the reference CLI's sidebar-todo feature): the current session task list.
+    if !app.todos.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Todo", Style::default().bold())));
+        for todo in &app.todos {
+            let (mark, color) = match todo.status.as_str() {
+                "completed" => ("✓", theme.dim),
+                "in_progress" => ("•", theme.tool),
+                _ => (" ", theme.dim),
+            };
             lines.push(Line::from(vec![
-                Span::styled("  $ ", Style::default().fg(theme.dim)),
-                Span::raw(format!("{cost:.4}")),
+                Span::styled(format!("[{mark}] "), Style::default().fg(color)),
+                Span::styled(todo.content.clone(), Style::default().fg(theme.dim)),
             ]));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Astra",
-        Style::default().fg(theme.dim),
-    )));
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::LEFT).title(" session "))
@@ -607,6 +677,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_line_renders_icon_and_label_not_raw_args() {
+        let mut app = App::new(vec!["build".into()]);
+        app.begin_turn("read a file".into());
+        app.apply_agent_event(&astra_proto::astra::engine::v1::AgentEvent {
+            kind: Some(astra_proto::astra::engine::v1::agent_event::Kind::ToolCall(
+                astra_proto::astra::engine::v1::ToolCallEvent {
+                    id: "t".into(),
+                    name: "Read".into(),
+                    input: r#"{"file_path":"src/main.rs"}"#.into(),
+                },
+            )),
+        });
+        app.apply_agent_event(&astra_proto::astra::engine::v1::AgentEvent {
+            kind: Some(
+                astra_proto::astra::engine::v1::agent_event::Kind::ToolResult(
+                    astra_proto::astra::engine::v1::ToolResultEvent {
+                        id: "t".into(),
+                        name: "Read".into(),
+                        summary: "done".into(),
+                        output: "".into(),
+                        is_error: false,
+                        truncated: false,
+                        full_output: None,
+                    },
+                ),
+            ),
+        });
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("Read src/main.rs"), "output: {out}");
+        assert!(
+            !out.contains("file_path"),
+            "raw input keys must not leak into the tool line: {out}"
+        );
+    }
+
+    #[test]
     fn renders_streamed_text_and_tool_status() {
         let mut app = App::new(vec!["build".into()]);
         app.begin_turn("hello".into());
@@ -655,5 +761,27 @@ mod tests {
             !lines.iter().any(|l| l.to_string().contains("```")),
             "fences are stripped"
         );
+    }
+
+    #[test]
+    fn inline_spans_never_panics_on_byte_boundaries() {
+        let theme = *theme_at(0);
+        // The closing-backtick-at-end case that used to over-slice by one byte.
+        for text in [
+            "`code`",
+            "x `code` y",
+            "`code`",
+            "a`b`c`d`e",
+            "é`code`",
+            "`co`dé**bold**",
+            "**bold**",
+            "**bold**é",
+            "`unclosed",
+            "**unclosed",
+            "`é`",
+        ] {
+            let _ = inline_spans(text, theme);
+            let _ = markdown_lines(text, theme);
+        }
     }
 }
