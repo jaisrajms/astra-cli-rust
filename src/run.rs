@@ -14,6 +14,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 use crate::endpoint::with_workspace;
+use crate::ids::new_request_id;
 use crate::tool::{tool_icon, tool_label};
 
 use astra_proto::astra::engine::v1::chat_service_client::ChatServiceClient;
@@ -91,6 +92,7 @@ pub async fn handle(args: RunArgs, channel: Channel) -> anyhow::Result<()> {
             model: args.model.clone(),
             images: Vec::new(),
             exec: args.exec.clone(),
+            request_id: Some(new_request_id()),
         })),
     };
     sink.send(msg)
@@ -581,6 +583,10 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello world");
         assert_eq!(msgs[0].agent, "plan");
+        assert!(
+            msgs[0].request_id.is_some(),
+            "C-04: every send must carry a fresh idempotency key"
+        );
     }
 
     #[tokio::test]

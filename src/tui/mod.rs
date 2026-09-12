@@ -28,6 +28,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 use crate::endpoint::with_workspace;
+use crate::ids::new_request_id;
 
 use futures::StreamExt;
 
@@ -338,6 +339,7 @@ fn build_send_message(session_id: Option<String>, content: String, agent: &str) 
             model: None,
             images: Vec::new(),
             exec: None,
+            request_id: Some(new_request_id()),
         })),
     }
 }
@@ -472,6 +474,10 @@ mod tests {
                 assert_eq!(sm.content, "hello");
                 assert_eq!(sm.agent, "plan");
                 assert!(sm.exec.is_none());
+                assert!(
+                    sm.request_id.is_some(),
+                    "C-04: every send must carry a fresh idempotency key"
+                );
             }
             other => panic!("expected SendMessage payload, got {other:?}"),
         }
